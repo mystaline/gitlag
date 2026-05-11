@@ -1,0 +1,11 @@
+/gitlag
+*.go~
+.DS_Store
+.env
+.idea/
+*.swp
+*.swo
+*~
+bin/
+configs/
+assets/
