@@ -1,4 +1,4 @@
-.PHONY: run build install tidy help
+.PHONY: run build install tidy test help
 
 APP=gitlag
 BINDIR?=$(shell go env GOPATH)/bin
@@ -13,9 +13,10 @@ build: ## Build binary to bin/
 	go build -o bin/$(APP) ./cmd/$(APP)
 
 install: ## Install to $GOPATH/bin (~/go/bin)
-	@mkdir -p $(BINDIR)
 	go build -o $(BINDIR)/$(APP) ./cmd/$(APP)
-	@echo "Installed → $(BINDIR)/$(APP)"
+
+test: ## Run all tests
+	go test ./... -count=1
 
 tidy: ## Tidy go modules
 	go mod tidy
