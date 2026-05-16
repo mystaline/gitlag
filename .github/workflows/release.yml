@@ -1,0 +1,87 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.os }}/${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+            ext: ""
+            pkg: tar.gz
+          - os: linux
+            arch: arm64
+            ext: ""
+            pkg: tar.gz
+          - os: darwin
+            arch: amd64
+            ext: ""
+            pkg: tar.gz
+          - os: darwin
+            arch: arm64
+            ext: ""
+            pkg: tar.gz
+          - os: windows
+            arch: amd64
+            ext: .exe
+            pkg: zip
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: "0"
+        run: |
+          go build -ldflags="-s -w -X main.version=${{ github.ref_name }}" \
+            -o gitlag${{ matrix.ext }} \
+            ./cmd/gitlag
+
+      - name: Package (tar.gz)
+        if: matrix.pkg == 'tar.gz'
+        run: |
+          tar -czf gitlag-${{ github.ref_name }}-${{ matrix.os }}-${{ matrix.arch }}.tar.gz \
+            gitlag README.md
+
+      - name: Package (zip)
+        if: matrix.pkg == 'zip'
+        run: |
+          zip gitlag-${{ github.ref_name }}-${{ matrix.os }}-${{ matrix.arch }}.zip \
+            gitlag${{ matrix.ext }} README.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gitlag-${{ matrix.os }}-${{ matrix.arch }}
+          path: gitlag-${{ github.ref_name }}-${{ matrix.os }}-${{ matrix.arch }}.${{ matrix.pkg }}
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: gitlag-*
+          generate_release_notes: true
