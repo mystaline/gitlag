@@ -12,6 +12,7 @@ No disk cache. No shallow-clone bugs. Just Gitea's API doing the heavy lifting.
 | `gitlag pr`      | All open PRs across your org, who wrote them, and where they're trying to go |
 | `gitlag show`    | Deep dive into one repo's branch divergence                                  |
 | `gitlag review`  | AI-generated code review for a specific pull request                         |
+| `gitlag version` | Print the installed version                                                  |
 
 ## Install
 
@@ -32,6 +33,32 @@ Or build locally:
 ```bash
 make build          # → bin/gitlag
 go build -o /wherever/you/want/gitlag ./cmd/gitlag
+```
+
+## Shell completion
+
+gitlag ships with completion scripts for bash, zsh, fish, and PowerShell via the built-in `completion` command.
+
+**zsh:**
+
+```bash
+gitlag completion zsh > "${fpath[1]}/_gitlag"
+# then restart your shell, or:
+source "${fpath[1]}/_gitlag"
+```
+
+**bash:**
+
+```bash
+gitlag completion bash > /etc/bash_completion.d/gitlag
+# or for a single user:
+gitlag completion bash >> ~/.bashrc && source ~/.bashrc
+```
+
+**fish:**
+
+```bash
+gitlag completion fish > ~/.config/fish/completions/gitlag.fish
 ```
 
 ## Config
@@ -106,16 +133,17 @@ gitlag pr
 ```
 
 ```
-┌──────────────────────────────┬──────────────────────────────────────┬──────────────────────────────┬──────────┬────────────┐
-│ REPOSITORY                   │ TITLE                                │ HEAD → BASE                  │ AUTHOR   │ DATE       │
-├──────────────────────────────┼──────────────────────────────────────┼──────────────────────────────┼──────────┼────────────┤
-│ backend-api                  │ fix: handle empty response on timeout │ fix/timeout → staging        │ alice    │ 2026-05-11 │
-│ frontend-app                 │ feature: add user settings panel      │ feat/settings → dev           │ bob      │ 2026-05-10 │
-│ shared-utils                 │ chore: bump dependencies              │ deps/upgrade → main           │ carol    │ 2026-05-08 │
-└──────────────────────────────┴──────────────────────────────────────┴──────────────────────────────┴──────────┴────────────┘
+┌──────┬──────────────────────┬──────────────────────────────────────┬──────────────────────────────┬────────────┬─────┐
+│ PR   │ REPOSITORY           │ TITLE                                │ HEAD → BASE                  │ AUTHOR     │ AGE │
+├──────┼──────────────────────┼──────────────────────────────────────┼──────────────────────────────┼────────────┼─────┤
+│ #42  │ backend-api          │ fix: handle empty response on        │ fix/timeout → staging        │ alice      │ 3d  │
+│      │                      │ timeout                              │                              │            │     │
+│ #17  │ frontend-app         │ feature: add user settings panel     │ feat/settings → dev          │ bob        │ 8d  │
+│ #5   │ shared-utils         │ chore: bump dependencies             │ deps/upgrade → main          │ carol      │ 22d │
+└──────┴──────────────────────┴──────────────────────────────────────┴──────────────────────────────┴────────────┴─────┘
 ```
 
-No divergence counts here — the PR already tells you what's inside.
+AGE is color-coded: green ≤ 3 days, yellow ≤ 14 days, red beyond that. Long titles word-wrap within their column.
 
 ### `show` — single repo detail
 
@@ -180,17 +208,48 @@ If the org can't be inferred from your config, pass it explicitly:
 gitlag review --repo backend-api --pr 42 --org my-org
 ```
 
+### `version` — print the installed version
+
+```bash
+gitlag version
+# gitlag v1.0.2
+```
+
 ### Flags
 
 | Flag            | Scope        | What it does                                   |
 | --------------- | ------------ | ---------------------------------------------- |
 | `--config`      | global       | Path to config file (default `~/.gitlag.yaml`) |
-| `--format`      | global       | `table` (default) or `json`                    |
+| `--format`      | global       | `table` (default), `json`, `csv`, `markdown`   |
 | `-s, --source`  | compare/show | Which branch you're comparing _from_           |
 | `-t, --targets` | compare      | Comma-separated target branches                |
 | `-r, --repo`    | show/review  | Repository name                                |
 | `-n, --pr`      | review       | Pull request number                            |
 | `--org`         | review       | Organization (optional, auto-detected)         |
+
+### Output formats
+
+All commands that produce tabular data support `--format`:
+
+| Format     | Best for                                    |
+| ---------- | ------------------------------------------- |
+| `table`    | Terminal — colored, aligned, word-wrapped   |
+| `json`     | Scripts, `jq` pipelines, CI output          |
+| `csv`      | Spreadsheets, Excel, Google Sheets          |
+| `markdown` | Paste into PR comments, wikis, Gitea issues |
+
+Examples:
+
+```bash
+# export stale PRs to a spreadsheet
+gitlag pr --format csv > prs.csv
+
+# pipe into jq
+gitlag pr --format json | jq '[.[] | select(.age_days > 14)]'
+
+# generate a markdown report for a PR comment
+gitlag compare -s staging --targets dev --format markdown
+```
 
 ## How it works
 

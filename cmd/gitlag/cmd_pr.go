@@ -1,10 +1,14 @@
 package main
 
 import (
+	"encoding/csv"
+	"encoding/json"
 	"fmt"
+	"os"
 	"regexp"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -16,15 +20,15 @@ import (
 )
 
 type PRResult struct {
-	Repository string
-	Number     int
-	Title      string
-	HeadRef    string
-	BaseRef    string
-	Author     string
-	CreatedAt  string
-	AgeDays    int
-	URL        string
+	Repository string `json:"repository"`
+	Number     int    `json:"number"`
+	Title      string `json:"title"`
+	HeadRef    string `json:"head_ref"`
+	BaseRef    string `json:"base_ref"`
+	Author     string `json:"author"`
+	CreatedAt  string `json:"created_at"`
+	AgeDays    int    `json:"age_days"`
+	URL        string `json:"url"`
 }
 
 func runPR(cmd *cobra.Command, args []string) error {
@@ -36,7 +40,9 @@ func runPR(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	fmt.Printf("\n%s 🔍 Discovering open pull requests across repos...%s\n", colorCyan, colorReset)
+	if format == "table" {
+		fmt.Printf("\n%s 🔍 Discovering open pull requests across repos...%s\n", colorCyan, colorReset)
+	}
 	orgs := cfg.GetOrgs()
 	client := gitea.NewClient(cfg.Gitea.URL, cfg.Gitea.Token, orgs[0])
 	var repos []gitea.Repository
@@ -53,7 +59,9 @@ func runPR(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	fmt.Printf("\r%s ✅ Discovered %d repositories in %s%s\n", colorGreen, len(repos), strings.Join(orgs, ", "), colorReset)
+	if format == "table" {
+		fmt.Printf("\r%s ✅ Discovered %d repositories in %s%s\n", colorGreen, len(repos), strings.Join(orgs, ", "), colorReset)
+	}
 
 	start := time.Now()
 	maxWorkers := runtime.NumCPU()
@@ -127,6 +135,17 @@ func runPR(cmd *cobra.Command, args []string) error {
 		return allPRs[i].CreatedAt > allPRs[j].CreatedAt
 	})
 
+	switch format {
+	case "json":
+		return json.NewEncoder(os.Stdout).Encode(allPRs)
+	case "csv":
+		outputPRCSV(allPRs)
+		return nil
+	case "markdown", "md":
+		outputPRMarkdown(allPRs)
+		return nil
+	}
+
 	if len(allPRs) == 0 {
 		fmt.Printf("\n%s ✅ No open pull requests found across %d repos.%s\n", colorGreen, len(repos), colorReset)
 		return nil
@@ -137,6 +156,34 @@ func runPR(cmd *cobra.Command, args []string) error {
 	fmt.Printf("\n%s 💡 %d open PRs across %d repos (total time: %v)%s\n",
 		colorFaint, prCount, repoCount, totalDuration.Round(time.Millisecond), colorReset)
 	return nil
+}
+
+func outputPRCSV(prs []PRResult) {
+	w := csv.NewWriter(os.Stdout)
+	_ = w.Write([]string{"repository", "number", "title", "head_ref", "base_ref", "author", "created_at", "age_days", "url"})
+	for _, pr := range prs {
+		_ = w.Write([]string{
+			pr.Repository,
+			strconv.Itoa(pr.Number),
+			pr.Title,
+			pr.HeadRef,
+			pr.BaseRef,
+			pr.Author,
+			pr.CreatedAt,
+			strconv.Itoa(pr.AgeDays),
+			pr.URL,
+		})
+	}
+	w.Flush()
+}
+
+func outputPRMarkdown(prs []PRResult) {
+	fmt.Println("| # | Repository | Title | Head → Base | Author | Age |")
+	fmt.Println("|---|------------|-------|-------------|--------|-----|")
+	for _, pr := range prs {
+		fmt.Printf("| [#%d](%s) | %s | %s | `%s` → `%s` | %s | %dd |\n",
+			pr.Number, pr.URL, pr.Repository, pr.Title, pr.HeadRef, pr.BaseRef, pr.Author, pr.AgeDays)
+	}
 }
 
 var ansiEscape = regexp.MustCompile(`\x1b\[[0-9;]*m`)

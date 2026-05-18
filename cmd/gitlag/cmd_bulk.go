@@ -1,10 +1,14 @@
 package main
 
 import (
+	"encoding/csv"
+	"encoding/json"
 	"fmt"
+	"os"
 	"path"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -15,19 +19,19 @@ import (
 )
 
 type BulkResult struct {
-	Repository      string
-	Comparisons     []BranchComparison
-	ResolvedTargets []string
-	Duration        time.Duration
-	PrepTime        time.Duration
-	Error           string
+	Repository      string             `json:"repository"`
+	Comparisons     []BranchComparison `json:"comparisons"`
+	ResolvedTargets []string           `json:"resolved_targets"`
+	Duration        time.Duration      `json:"duration_ms"`
+	PrepTime        time.Duration      `json:"prep_time_ms"`
+	Error           string             `json:"error,omitempty"`
 }
 
 type BranchComparison struct {
-	TargetBranch string
-	Info         DivergenceInfo
-	InSync       bool
-	IsMissing    bool
+	TargetBranch string        `json:"target_branch"`
+	Info         DivergenceInfo `json:"info"`
+	InSync       bool          `json:"in_sync"`
+	IsMissing    bool          `json:"is_missing"`
 }
 
 type workerStatus struct {
@@ -45,7 +49,9 @@ func bulkImpl(configPath string, noFetch bool, format, source string, targets []
 		return err
 	}
 
-	fmt.Printf("\n%s 🔍 Discovering Gitea repositories...%s\n", colorCyan, colorReset)
+	if format == "table" {
+		fmt.Printf("\n%s 🔍 Discovering Gitea repositories...%s\n", colorCyan, colorReset)
+	}
 	orgs := cfg.GetOrgs()
 	client := gitea.NewClient(cfg.Gitea.URL, cfg.Gitea.Token, orgs[0])
 	var repos []gitea.Repository
@@ -72,67 +78,65 @@ func bulkImpl(configPath string, noFetch bool, format, source string, targets []
 		}
 	}
 
-	fmt.Printf("\r%s ✅ Discovered %d repositories in %s%s\n", colorGreen, len(repos), strings.Join(orgs, ", "), colorReset)
-	fmt.Printf("   Source: %s%s%s | Targets: %s%s%s\n\n", colorBold, source, colorReset, colorBold, strings.Join(targets, ", "), colorReset)
+	if format == "table" {
+		fmt.Printf("\r%s ✅ Discovered %d repositories in %s%s\n", colorGreen, len(repos), strings.Join(orgs, ", "), colorReset)
+		fmt.Printf("   Source: %s%s%s | Targets: %s%s%s\n\n", colorBold, source, colorReset, colorBold, strings.Join(targets, ", "), colorReset)
+	}
 
 	start := time.Now()
 
 	maxWorkers := runtime.NumCPU()
 
 	var (
-		results []BulkResult
+		results   []BulkResult
 		resultsMu sync.Mutex
-		wg sync.WaitGroup
-		semaphore = make(chan struct{}, maxWorkers) 
-		
-		// Status tracking
+		wg        sync.WaitGroup
+		semaphore = make(chan struct{}, maxWorkers)
+
 		completedCount int
 		completedMu    sync.Mutex
 		workerStates   = make([]workerStatus, maxWorkers)
 		statesMu       sync.Mutex
 	)
 
-	// Clean up any leftovers from previous terminal state
-	fmt.Print("\033[s") // Save cursor position
+	var done chan bool
+	if format == "table" {
+		fmt.Print("\033[s")
+		done = make(chan bool)
+		go func() {
+			ticker := time.NewTicker(100 * time.Millisecond)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-done:
+					return
+				case <-ticker.C:
+					statesMu.Lock()
+					completedMu.Lock()
 
-	// UI Refresh Loop
-	done := make(chan bool)
-	go func() {
-		ticker := time.NewTicker(100 * time.Millisecond)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-done:
-				return
-			case <-ticker.C:
-				statesMu.Lock()
-				completedMu.Lock()
-				
-				// Reset to saved position
-				fmt.Print("\033[u\033[J") 
-				
-				// Show total progress
-				percent := float64(completedCount) / float64(len(repos)) * 100
-				barWidth := 30
-				filled := int(float64(barWidth) * float64(completedCount) / float64(len(repos)))
-				bar := strings.Repeat("█", filled) + strings.Repeat("░", barWidth-filled)
-				
-				fmt.Printf("%s 📊 Progress: [%s] %.0f%% (%d/%d)%s\n", colorCyan, bar, percent, completedCount, len(repos), colorReset)
-				
-				// Show active workers
-				for i, state := range workerStates {
-					if state.repoName != "" {
-						fmt.Printf("   %s Slot %d:%s %-30s %s%s%s\n", colorFaint, i+1, colorReset, state.repoName, colorYellow, state.status, colorReset)
-					} else {
-						fmt.Printf("   %s Slot %d:%s %s-- idle --%s\n", colorFaint, i+1, colorReset, colorFaint, colorReset)
+					fmt.Print("\033[u\033[J")
+
+					percent := float64(completedCount) / float64(len(repos)) * 100
+					barWidth := 30
+					filled := int(float64(barWidth) * float64(completedCount) / float64(len(repos)))
+					bar := strings.Repeat("█", filled) + strings.Repeat("░", barWidth-filled)
+
+					fmt.Printf("%s 📊 Progress: [%s] %.0f%% (%d/%d)%s\n", colorCyan, bar, percent, completedCount, len(repos), colorReset)
+
+					for i, state := range workerStates {
+						if state.repoName != "" {
+							fmt.Printf("   %s Slot %d:%s %-30s %s%s%s\n", colorFaint, i+1, colorReset, state.repoName, colorYellow, state.status, colorReset)
+						} else {
+							fmt.Printf("   %s Slot %d:%s %s-- idle --%s\n", colorFaint, i+1, colorReset, colorFaint, colorReset)
+						}
 					}
+
+					completedMu.Unlock()
+					statesMu.Unlock()
 				}
-				
-				completedMu.Unlock()
-				statesMu.Unlock()
 			}
-		}
-	}()
+		}()
+	}
 
 	for i, r := range repos {
 		wg.Add(1)
@@ -241,20 +245,30 @@ func bulkImpl(configPath string, noFetch bool, format, source string, targets []
 	}
 
 	wg.Wait()
-	done <- true
+	if done != nil {
+		done <- true
+	}
 	totalDuration := time.Since(start)
 
-	// Final clear of the status area
-	fmt.Print("\033[u\033[J")
-
-	fmt.Printf(" ✅ %sAnalysis Complete%s (total time: %s%v%s)\n", colorBold+colorGreen, colorReset, colorBold, totalDuration.Round(time.Millisecond), colorReset)
-	fmt.Printf("%s --------------------------------------------------------------------------------%s\n\n", colorFaint, colorReset)
-
-	// Compute union of all resolved targets (patterns may yield different branches per repo)
 	displayTargets := unionResolvedTargets(results)
 	if len(displayTargets) == 0 {
 		displayTargets = targets
 	}
+
+	switch format {
+	case "json":
+		return json.NewEncoder(os.Stdout).Encode(results)
+	case "csv":
+		outputBulkCSV(results)
+		return nil
+	case "markdown", "md":
+		outputBulkMarkdown(results, source, displayTargets)
+		return nil
+	}
+
+	fmt.Print("\033[u\033[J")
+	fmt.Printf(" ✅ %sAnalysis Complete%s (total time: %s%v%s)\n", colorBold+colorGreen, colorReset, colorBold, totalDuration.Round(time.Millisecond), colorReset)
+	fmt.Printf("%s --------------------------------------------------------------------------------%s\n\n", colorFaint, colorReset)
 	outputBulkTable(results, source, displayTargets)
 
 	return nil
@@ -298,6 +312,69 @@ func unionResolvedTargets(results []BulkResult) []string {
 	}
 	sort.Strings(all)
 	return all
+}
+
+func outputBulkCSV(results []BulkResult) {
+	sort.Slice(results, func(i, j int) bool { return results[i].Repository < results[j].Repository })
+	w := csv.NewWriter(os.Stdout)
+	_ = w.Write([]string{"repository", "target_branch", "ahead", "behind", "in_sync", "is_missing"})
+	for _, r := range results {
+		for _, c := range r.Comparisons {
+			_ = w.Write([]string{
+				r.Repository,
+				c.TargetBranch,
+				strconv.Itoa(c.Info.AheadCount),
+				strconv.Itoa(c.Info.BehindCount),
+				strconv.FormatBool(c.InSync),
+				strconv.FormatBool(c.IsMissing),
+			})
+		}
+	}
+	w.Flush()
+}
+
+func outputBulkMarkdown(results []BulkResult, source string, targets []string) {
+	sort.Slice(results, func(i, j int) bool { return results[i].Repository < results[j].Repository })
+
+	header := "| Repository |"
+	sep := "|------------|"
+	for _, t := range targets {
+		header += " " + t + " |"
+		sep += strings.Repeat("-", len(t)+2) + "|"
+	}
+	fmt.Printf("**%s → %s**\n\n", source, strings.Join(targets, ", "))
+	fmt.Println(header)
+	fmt.Println(sep)
+
+	for _, r := range results {
+		byTarget := make(map[string]BranchComparison, len(r.Comparisons))
+		for _, c := range r.Comparisons {
+			byTarget[c.TargetBranch] = c
+		}
+		row := "| " + r.Repository + " |"
+		for _, t := range targets {
+			c, ok := byTarget[t]
+			switch {
+			case !ok || c.IsMissing:
+				row += " — |"
+			case c.InSync:
+				row += " ✔ |"
+			default:
+				cell := ""
+				if c.Info.AheadCount > 0 {
+					cell += fmt.Sprintf("↑%d", c.Info.AheadCount)
+				}
+				if c.Info.BehindCount > 0 {
+					if cell != "" {
+						cell += " "
+					}
+					cell += fmt.Sprintf("↓%d", c.Info.BehindCount)
+				}
+				row += " " + cell + " |"
+			}
+		}
+		fmt.Println(row)
+	}
 }
 
 func outputBulkTable(results []BulkResult, source string, targets []string) {

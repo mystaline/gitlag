@@ -1,11 +1,13 @@
 package main
 
 import (
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"os"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"text/tabwriter"
@@ -15,20 +17,20 @@ import (
 )
 
 type ScanResult struct {
-	Repository   string
-	SourceBranch string
-	Parent       string
-	Divergence   map[string]DivergenceInfo
-	Error        string
+	Repository   string                    `json:"repository"`
+	SourceBranch string                    `json:"source_branch"`
+	Parent       string                    `json:"parent"`
+	Divergence   map[string]DivergenceInfo `json:"divergence"`
+	Error        string                    `json:"error,omitempty"`
 }
 
 type DivergenceInfo struct {
-	AheadCount      int
-	BehindCount     int
-	IsContentSynced bool
-	IsSquashMerged  bool
-	LastDate        string
-	LastAuthor      string
+	AheadCount      int    `json:"ahead"`
+	BehindCount     int    `json:"behind"`
+	IsContentSynced bool   `json:"in_sync"`
+	IsSquashMerged  bool   `json:"squash_merged"`
+	LastDate        string `json:"last_date"`
+	LastAuthor      string `json:"last_author"`
 }
 
 func showImpl(configPath string, noFetch bool, format, repoName, source string) error {
@@ -122,9 +124,14 @@ func showImpl(configPath string, noFetch bool, format, repoName, source string) 
 	}
 	wg.Wait()
 
-	if format == "json" {
+	switch format {
+	case "json":
 		outputShowJSON(result)
-	} else {
+	case "csv":
+		outputShowCSV(result)
+	case "markdown", "md":
+		outputShowMarkdown(result)
+	default:
 		outputShowTable(result)
 	}
 	return nil
@@ -209,6 +216,52 @@ func outputShowTable(result ScanResult) {
 			line += fmt.Sprintf("   %s%s%s", colorFaint, div.LastDate, colorReset)
 		}
 		fmt.Fprintf(w, "%s\n", line)
+	}
+}
+
+func outputShowCSV(result ScanResult) {
+	branches := make([]string, 0, len(result.Divergence))
+	for b := range result.Divergence {
+		branches = append(branches, b)
+	}
+	sort.Strings(branches)
+
+	w := csv.NewWriter(os.Stdout)
+	_ = w.Write([]string{"repository", "source_branch", "branch", "ahead", "behind", "in_sync", "last_date", "last_author"})
+	for _, b := range branches {
+		info := result.Divergence[b]
+		_ = w.Write([]string{
+			result.Repository,
+			result.SourceBranch,
+			b,
+			strconv.Itoa(info.AheadCount),
+			strconv.Itoa(info.BehindCount),
+			strconv.FormatBool(info.IsContentSynced),
+			info.LastDate,
+			info.LastAuthor,
+		})
+	}
+	w.Flush()
+}
+
+func outputShowMarkdown(result ScanResult) {
+	branches := make([]string, 0, len(result.Divergence))
+	for b := range result.Divergence {
+		branches = append(branches, b)
+	}
+	sort.Strings(branches)
+
+	fmt.Printf("## %s (source: `%s`)\n\n", result.Repository, result.SourceBranch)
+	fmt.Println("| Branch | Ahead | Behind | In Sync | Last Date |")
+	fmt.Println("|--------|------:|-------:|:-------:|-----------|")
+	for _, b := range branches {
+		info := result.Divergence[b]
+		sync := "✔"
+		if !info.IsContentSynced {
+			sync = "✗"
+		}
+		fmt.Printf("| `%s` | %d | %d | %s | %s |\n",
+			b, info.AheadCount, info.BehindCount, sync, info.LastDate)
 	}
 }
 

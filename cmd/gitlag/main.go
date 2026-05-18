@@ -7,6 +7,8 @@ import (
 	"github.com/spf13/cobra"
 )
 
+var version = "dev"
+
 var (
 	configPath string
 	noFetch    bool
@@ -63,10 +65,18 @@ var reviewCmd = &cobra.Command{
 	RunE:  runReview,
 }
 
+var versionCmd = &cobra.Command{
+	Use:   "version",
+	Short: "Print the version",
+	Run: func(cmd *cobra.Command, args []string) {
+		fmt.Printf("gitlag %s\n", version)
+	},
+}
+
 func init() {
 	rootCmd.PersistentFlags().StringVar(&configPath, "config", "", "path to config file (default: ~/.gitlag.yaml)")
 	rootCmd.PersistentFlags().BoolVar(&noFetch, "no-fetch", false, "use cache without fetching")
-	rootCmd.PersistentFlags().StringVar(&format, "format", "table", "output format: table or json")
+	rootCmd.PersistentFlags().StringVar(&format, "format", "table", "output format: table, json, csv, markdown")
 
 	showCmd.Flags().StringP("source", "s", "dev", "source branch to compare from")
 	showCmd.Flags().StringP("repo", "r", "", "repository name (required)")
@@ -85,6 +95,7 @@ func init() {
 	rootCmd.AddCommand(compareCmd)
 	rootCmd.AddCommand(prCmd)
 	rootCmd.AddCommand(reviewCmd)
+	rootCmd.AddCommand(versionCmd)
 }
 
 func main() {
