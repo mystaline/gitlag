@@ -2,11 +2,13 @@ package main
 
 import (
 	"fmt"
+	"regexp"
 	"runtime"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/mystaline/gitlag/internal/config"
 	"github.com/mystaline/gitlag/internal/gitea"
@@ -15,11 +17,13 @@ import (
 
 type PRResult struct {
 	Repository string
+	Number     int
 	Title      string
 	HeadRef    string
 	BaseRef    string
 	Author     string
 	CreatedAt  string
+	AgeDays    int
 	URL        string
 }
 
@@ -89,12 +93,14 @@ func runPR(cmd *cobra.Command, args []string) error {
 			for _, pr := range pulls {
 				prResult := PRResult{
 					Repository: repo.Name,
+					Number:     pr.Number,
 					Title:      pr.Title,
 					HeadRef:    pr.Head.Ref,
 					BaseRef:    pr.Base.Ref,
 					Author:     pr.User.Login,
 					CreatedAt:  formatDate(pr.CreatedAt),
-					URL:         pr.HTMLURL,
+					AgeDays:    prAgeDays(pr.CreatedAt),
+					URL:        pr.HTMLURL,
 				}
 
 				repoPRs = append(repoPRs, prResult)
@@ -133,37 +139,157 @@ func runPR(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+var ansiEscape = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+
+func visualLen(s string) int {
+	return utf8.RuneCountInString(ansiEscape.ReplaceAllString(s, ""))
+}
+
+func padRight(s string, width int) string {
+	if pad := width - visualLen(s); pad > 0 {
+		return s + strings.Repeat(" ", pad)
+	}
+	return s
+}
+
+func wrapWords(s string, width int) []string {
+	if utf8.RuneCountInString(s) <= width {
+		return []string{s}
+	}
+	var lines []string
+	cur := ""
+	for _, w := range strings.Fields(s) {
+		switch {
+		case cur == "":
+			cur = w
+		case utf8.RuneCountInString(cur)+1+utf8.RuneCountInString(w) <= width:
+			cur += " " + w
+		default:
+			lines = append(lines, cur)
+			cur = w
+		}
+	}
+	if cur != "" {
+		lines = append(lines, cur)
+	}
+	return lines
+}
+
+func wrapChars(s string, width int) []string {
+	runes := []rune(s)
+	var lines []string
+	for len(runes) > width {
+		lines = append(lines, string(runes[:width]))
+		runes = runes[width:]
+	}
+	if len(runes) > 0 {
+		lines = append(lines, string(runes))
+	}
+	return lines
+}
+
 func printPRTable(prs []PRResult) {
-	fmt.Printf("%s┌──────────────────────────────┬────────────────────────────────────────────────┬──────────────────────────────────────┬────────────┬────────────┐%s\n",
-		colorFaint, colorReset)
-	fmt.Printf("%s│%s %s %s│%s %s %s│%s %s %s│%s %s %s│%s %s %s│%s\n",
-		colorFaint, colorReset, colorBold+"REPOSITORY"+colorReset, colorFaint,
-		colorReset, colorBold+"TITLE"+colorReset, colorFaint,
-		colorReset, colorBold+"HEAD → BASE"+colorReset, colorFaint,
-		colorReset, colorBold+"AUTHOR"+colorReset, colorFaint,
-		colorReset, colorBold+"DATE"+colorReset, colorFaint,
-		colorReset)
-	fmt.Printf("%s├──────────────────────────────┼────────────────────────────────────────────────┼──────────────────────────────────────┼────────────┼────────────┤%s\n",
-		colorFaint, colorReset)
+	const (
+		wPR     = 5
+		wRepo   = 22
+		wTitle  = 38
+		wRef    = 30
+		wAuthor = 10
+		wAge    = 5
+	)
+	widths := [6]int{wPR, wRepo, wTitle, wRef, wAuthor, wAge}
+
+	sep := func(l, m, r string) string {
+		var b strings.Builder
+		b.WriteString(colorFaint)
+		b.WriteString(l)
+		for i, w := range widths {
+			if i > 0 {
+				b.WriteString(m)
+			}
+			b.WriteString(strings.Repeat("─", w+2))
+		}
+		b.WriteString(r)
+		b.WriteString(colorReset)
+		return b.String()
+	}
+
+	printRow := func(cells [6][]string) {
+		maxL := 1
+		for _, c := range cells {
+			if len(c) > maxL {
+				maxL = len(c)
+			}
+		}
+		for i := 0; i < maxL; i++ {
+			fmt.Print(colorFaint + "│" + colorReset)
+			for j, c := range cells {
+				line := ""
+				if i < len(c) {
+					line = c[i]
+				}
+				fmt.Print(" " + padRight(line, widths[j]) + " " + colorFaint + "│" + colorReset)
+			}
+			fmt.Println()
+		}
+	}
+
+	fmt.Println(sep("┌", "┬", "┐"))
+	printRow([6][]string{
+		{colorBold + "PR" + colorReset},
+		{colorBold + "REPOSITORY" + colorReset},
+		{colorBold + "TITLE" + colorReset},
+		{colorBold + "HEAD → BASE" + colorReset},
+		{colorBold + "AUTHOR" + colorReset},
+		{colorBold + "AGE" + colorReset},
+	})
+	fmt.Println(sep("├", "┼", "┤"))
 
 	for _, pr := range prs {
-		repoCol := fmt.Sprintf("%s%-28s%s", colorCyan, truncate(pr.Repository, 28), colorReset)
-		titleCol := truncate(pr.Title, 48)
-		headBase := fmt.Sprintf("%s%-20s%s %s→%s %s%s%s",
-			colorYellow, pr.HeadRef, colorReset, colorFaint, colorReset, colorGreen, pr.BaseRef, colorReset)
-		authorCol := fmt.Sprintf("%s%-10s%s", colorFaint, truncate(pr.Author, 10), colorReset)
-		dateCol := fmt.Sprintf("%s%-10s%s", colorFaint, pr.CreatedAt, colorReset)
+		titleLines := wrapWords(pr.Title, wTitle)
 
-		fmt.Printf("%s│%s %s %s│%s %-48s %s│%s %-36s %s│%s %-10s %s│%s %-10s %s│%s\n",
-			colorFaint, colorReset, repoCol, colorFaint,
-			colorReset, titleCol, colorFaint,
-			colorReset, headBase, colorFaint,
-			colorReset, authorCol, colorFaint,
-			colorReset, dateCol, colorFaint,
-			colorReset)
+		var refLines []string
+		if utf8.RuneCountInString(pr.HeadRef+" → "+pr.BaseRef) <= wRef {
+			refLines = []string{
+				colorYellow + pr.HeadRef + colorReset + " " + colorFaint + "→" + colorReset + " " + colorGreen + pr.BaseRef + colorReset,
+			}
+		} else {
+			for _, l := range wrapChars(pr.HeadRef, wRef) {
+				refLines = append(refLines, colorYellow+l+colorReset)
+			}
+			refLines = append(refLines, colorFaint+"→"+colorReset+" "+colorGreen+pr.BaseRef+colorReset)
+		}
+
+		printRow([6][]string{
+			{colorFaint + fmt.Sprintf("#%-4d", pr.Number) + colorReset},
+			{colorCyan + truncate(pr.Repository, wRepo) + colorReset},
+			titleLines,
+			refLines,
+			{colorFaint + truncate(pr.Author, wAuthor) + colorReset},
+			{formatAge(pr.AgeDays)},
+		})
 	}
-	fmt.Printf("%s└──────────────────────────────┴────────────────────────────────────────────────┴──────────────────────────────────────┴────────────┴────────────┘%s\n",
-		colorFaint, colorReset)
+
+	fmt.Println(sep("└", "┴", "┘"))
+}
+
+func formatAge(days int) string {
+	switch {
+	case days <= 3:
+		return fmt.Sprintf("%s%dd%s", colorGreen, days, colorReset)
+	case days <= 14:
+		return fmt.Sprintf("%s%dd%s", colorYellow, days, colorReset)
+	default:
+		return fmt.Sprintf("%s%dd%s", colorRed, days, colorReset)
+	}
+}
+
+func prAgeDays(createdAt string) int {
+	t, err := time.Parse(time.RFC3339, createdAt)
+	if err != nil {
+		return 0
+	}
+	return int(time.Since(t).Hours() / 24)
 }
 
 func truncate(s string, max int) string {
