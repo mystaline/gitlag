@@ -11,6 +11,7 @@ No disk cache. No shallow-clone bugs. Just Gitea's API doing the heavy lifting.
 | `gitlag compare` | Per-repo table of commits ahead/behind between branches                      |
 | `gitlag pr`      | All open PRs across your org, who wrote them, and where they're trying to go |
 | `gitlag show`    | Deep dive into one repo's branch divergence                                  |
+| `gitlag review`  | AI-generated code review for a specific pull request                         |
 
 ## Install
 
@@ -48,7 +49,24 @@ gitea:
         - service-*
       exclude:
         - "*-legacy"
+
+# AI review (optional — only needed for gitlag review)
+ai:
+  provider: deepseek # deepseek | kimi | anthropic | ollama
+  model: deepseek-v4-pro # model name for the chosen provider
 ```
+
+API keys are never stored in the config file. Set them as environment variables — add to your `~/.zshrc` or `~/.bashrc`:
+
+```bash
+# Pick the one matching your provider
+export DEEPSEEK_API_KEY="sk-..."
+export MOONSHOT_API_KEY="sk-..."   # for kimi
+export ANTHROPIC_API_KEY="sk-..."
+# ollama needs no key — it runs locally
+```
+
+See [`configs/gitlag.example.yaml`](configs/gitlag.example.yaml) for a full annotated example.
 
 ## Commands
 
@@ -123,6 +141,45 @@ Each branch compared to staging:
 
 Every line reads like plain English — `↑ ahead of source` means that branch has commits staging doesn't, `↓ behind source` means staging has moved past it.
 
+### `review` — AI code review for a PR
+
+Point it at any open PR and get a streamed review scoped to the exact commits in the PR:
+
+```bash
+gitlag review --repo backend-api --pr 42
+```
+
+```
+ 🔍 Fetching PR #42 from my-org/backend-api...
+ 📄 Fetching diff...
+ 🤖 Reviewing with deepseek / deepseek-v4-pro...
+
+╔══════════════════════════════════════════════════════════════╗
+║ fix: handle empty response on timeout
+║ fix/timeout → staging  by alice
+╚══════════════════════════════════════════════════════════════╝
+
+## Goal Summary
+...
+
+## Key Changes
+...
+
+## Code Review
+...
+
+## Verdict
+⚠️ Minor concerns
+```
+
+The diff is computed against the true merge base — not the tip of the base branch — so the review only covers what the PR actually introduces.
+
+If the org can't be inferred from your config, pass it explicitly:
+
+```bash
+gitlag review --repo backend-api --pr 42 --org my-org
+```
+
 ### Flags
 
 | Flag            | Scope        | What it does                                   |
@@ -131,7 +188,9 @@ Every line reads like plain English — `↑ ahead of source` means that branch 
 | `--format`      | global       | `table` (default) or `json`                    |
 | `-s, --source`  | compare/show | Which branch you're comparing _from_           |
 | `-t, --targets` | compare      | Comma-separated target branches                |
-| `-r, --repo`    | show         | Single repository name                         |
+| `-r, --repo`    | show/review  | Repository name                                |
+| `-n, --pr`      | review       | Pull request number                            |
+| `--org`         | review       | Organization (optional, auto-detected)         |
 
 ## How it works
 
