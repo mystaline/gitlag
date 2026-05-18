@@ -56,6 +56,13 @@ var prCmd = &cobra.Command{
 	RunE: runPR,
 }
 
+var reviewCmd = &cobra.Command{
+	Use:   "review",
+	Short: "AI review of a specific pull request",
+	Long:  `Fetches a pull request diff from Gitea and streams an AI-generated review.`,
+	RunE:  runReview,
+}
+
 func init() {
 	rootCmd.PersistentFlags().StringVar(&configPath, "config", "", "path to config file (default: ~/.gitlag.yaml)")
 	rootCmd.PersistentFlags().BoolVar(&noFetch, "no-fetch", false, "use cache without fetching")
@@ -68,9 +75,16 @@ func init() {
 	compareCmd.Flags().StringSliceP("targets", "t", []string{}, "comma-separated target branches to compare against (e.g. dev,dev-alpha)")
 	_ = compareCmd.MarkFlagRequired("targets")
 
+	reviewCmd.Flags().StringP("repo", "r", "", "repository name (required)")
+	reviewCmd.Flags().IntP("pr", "n", 0, "pull request number (required)")
+	reviewCmd.Flags().String("org", "", "organization name (optional, auto-detected from config)")
+	_ = reviewCmd.MarkFlagRequired("repo")
+	_ = reviewCmd.MarkFlagRequired("pr")
+
 	rootCmd.AddCommand(showCmd)
 	rootCmd.AddCommand(compareCmd)
 	rootCmd.AddCommand(prCmd)
+	rootCmd.AddCommand(reviewCmd)
 }
 
 func main() {

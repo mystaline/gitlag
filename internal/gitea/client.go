@@ -297,23 +297,216 @@ func (c *Client) ListBranches(owner, repo string) ([]string, error) {
 
 // PullRequest holds the subset of Gitea PR fields we need.
 type PullRequest struct {
-	ID        int       `json:"id"`
-	Title     string    `json:"title"`
-	State     string    `json:"state"`
-	HTMLURL   string    `json:"html_url"`
-	CreatedAt string    `json:"created_at"`
-	Head      PRBranch  `json:"head"`
-	Base      PRBranch  `json:"base"`
-	User      PRUser    `json:"user"`
+	ID        int      `json:"id"`
+	Number    int      `json:"number"`
+	Title     string   `json:"title"`
+	Body      string   `json:"body"`
+	State     string   `json:"state"`
+	HTMLURL   string   `json:"html_url"`
+	CreatedAt string   `json:"created_at"`
+	Head      PRBranch `json:"head"`
+	Base      PRBranch `json:"base"`
+	User      PRUser   `json:"user"`
 }
 
 type PRBranch struct {
 	Label string `json:"label"`
 	Ref   string `json:"ref"`
+	SHA   string `json:"sha"`
 }
 
 type PRUser struct {
 	Login string `json:"login"`
+}
+
+// PRFile is one entry from the /pulls/{index}/files API response.
+type PRFile struct {
+	Filename  string `json:"filename"`
+	Status    string `json:"status"`
+	Additions int    `json:"additions"`
+	Deletions int    `json:"deletions"`
+	Changes   int    `json:"changes"`
+}
+
+// GetPullRequest fetches a single pull request by number.
+func (c *Client) GetPullRequest(owner, repo string, number int) (*PullRequest, error) {
+	endpoint := fmt.Sprintf("%s/api/v1/repos/%s/%s/pulls/%d", c.baseURL, owner, repo, number)
+
+	req, err := http.NewRequest("GET", endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Authorization", fmt.Sprintf("token %s", c.token))
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("api call: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, fmt.Errorf("PR #%d not found in %s/%s", number, owner, repo)
+	}
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("api error: %d %s", resp.StatusCode, string(body))
+	}
+
+	var pr PullRequest
+	if err := json.NewDecoder(resp.Body).Decode(&pr); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	return &pr, nil
+}
+
+const maxDiffBytes = 150_000
+
+// GetPullRequestDiff returns a unified diff for the PR using the true merge base
+// (parent of the oldest PR commit) rather than the base branch tip. This ensures
+// only the commits belonging to this PR are reflected in the diff.
+func (c *Client) GetPullRequestDiff(owner, repo string, number int) (string, error) {
+	pr, err := c.GetPullRequest(owner, repo, number)
+	if err != nil {
+		return "", err
+	}
+
+	mergeBase, err := c.prMergeBase(owner, repo, number)
+	if err != nil {
+		// Fall back to base branch SHA if merge base lookup fails
+		mergeBase = pr.Base.SHA
+	}
+
+	files, err := c.listPRFiles(owner, repo, number)
+	if err != nil {
+		return "", err
+	}
+
+	var sb strings.Builder
+	totalBytes := 0
+
+	for _, f := range files {
+		var baseContent, headContent string
+
+		if f.Status != "added" {
+			baseContent, _ = c.rawFileContent(owner, repo, mergeBase, f.Filename)
+		}
+		if f.Status != "deleted" {
+			headContent, _ = c.rawFileContent(owner, repo, pr.Head.SHA, f.Filename)
+		}
+
+		fileDiff := buildUnifiedDiff(f.Filename, baseContent, headContent)
+
+		// Emit diff (what changed) followed by the full HEAD file (full context).
+		section := fileDiff
+		if headContent != "" {
+			section += fmt.Sprintf("\n// full file: %s\n%s\n", f.Filename, headContent)
+		}
+
+		if section == "" {
+			continue
+		}
+
+		sb.WriteString(section)
+		totalBytes += len(section)
+
+		if totalBytes >= maxDiffBytes {
+			sb.WriteString("\n[diff truncated — exceeds 150 KB]\n")
+			break
+		}
+	}
+
+	return sb.String(), nil
+}
+
+// prMergeBase returns the SHA of the common ancestor (merge base) for the PR.
+// It fetches the PR's commit list (newest-first) and returns the parent of the oldest commit.
+func (c *Client) prMergeBase(owner, repo string, number int) (string, error) {
+	endpoint := fmt.Sprintf("%s/api/v1/repos/%s/%s/pulls/%d/commits", c.baseURL, owner, repo, number)
+	req, err := http.NewRequest("GET", endpoint, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", fmt.Sprintf("token %s", c.token))
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("commits: %d", resp.StatusCode)
+	}
+
+	var commits []struct {
+		SHA     string `json:"sha"`
+		Parents []struct {
+			SHA string `json:"sha"`
+		} `json:"parents"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&commits); err != nil {
+		return "", err
+	}
+	if len(commits) == 0 {
+		return "", fmt.Errorf("no commits in PR")
+	}
+
+	// Commits are newest-first; oldest is last.
+	oldest := commits[len(commits)-1]
+	if len(oldest.Parents) == 0 {
+		return "", fmt.Errorf("oldest commit has no parent")
+	}
+	return oldest.Parents[0].SHA, nil
+}
+
+// listPRFiles returns changed files for a PR via the Gitea API.
+func (c *Client) listPRFiles(owner, repo string, number int) ([]PRFile, error) {
+	endpoint := fmt.Sprintf("%s/api/v1/repos/%s/%s/pulls/%d/files", c.baseURL, owner, repo, number)
+	req, err := http.NewRequest("GET", endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Authorization", fmt.Sprintf("token %s", c.token))
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("api call: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("files error: %d %s", resp.StatusCode, string(body))
+	}
+
+	var files []PRFile
+	if err := json.NewDecoder(resp.Body).Decode(&files); err != nil {
+		return nil, fmt.Errorf("decode files: %w", err)
+	}
+	return files, nil
+}
+
+// rawFileContent fetches raw file content at a specific commit SHA.
+// Uses ?token query param since Gitea web raw endpoints don't accept Authorization headers.
+func (c *Client) rawFileContent(owner, repo, sha, filepath string) (string, error) {
+	rawURL := fmt.Sprintf("%s/%s/%s/raw/commit/%s/%s?token=%s",
+		c.baseURL, owner, repo, sha, filepath, c.token)
+
+	resp, err := c.client.Get(rawURL)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("raw fetch %d", resp.StatusCode)
+	}
+
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 50_000))
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
 }
 
 // ListPullRequests returns open pull requests for a repo (paginated).

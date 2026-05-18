@@ -1,0 +1,32 @@
+# GitLag Configuration Example
+# Copy this to ~/.gitlag.yaml and fill in your details
+
+gitea:
+  url: https://your-gitea-instance.example.com
+  token: "${GITEA_TOKEN}"  # set via environment variable
+
+  repos:
+    - org: your-org
+      include:
+        - "*"
+      exclude:
+        - "archived-*"
+
+    - org: another-org
+      include:
+        - "service-*"
+      exclude: []
+
+cache_dir: ~/.gitlag-cache
+offline: false
+
+# AI review: gitlag review --repo <name> --pr <number>
+# Supported providers: deepseek | kimi | anthropic | ollama
+# API keys via environment variables (never stored here):
+#   deepseek  → DEEPSEEK_API_KEY
+#   kimi      → MOONSHOT_API_KEY
+#   anthropic → ANTHROPIC_API_KEY
+#   ollama    → (no key needed, runs locally)
+ai:
+  provider: deepseek
+  model: deepseek-v4-pro   # or: kimi-k2-turbo-preview | claude-haiku-4-5-20251001 | qwen3-coder

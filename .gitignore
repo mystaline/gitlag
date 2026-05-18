@@ -7,5 +7,5 @@
 *.swo
 *~
 bin/
-configs/
+configs/gitlag.yaml
 assets/

@@ -13,9 +13,15 @@ type Config struct {
 	Offline       bool              `yaml:"offline"`
 	CacheDir      string            `yaml:"cache_dir"`
 	Gitea         GiteaConfig       `yaml:"gitea"`
+	AI            AIConfig          `yaml:"ai"`
 	Include       []string          `yaml:"include"`
 	Exclude       []string          `yaml:"exclude"`
 	BranchParents map[string]string `yaml:"branch_parents"`
+}
+
+type AIConfig struct {
+	Provider string `yaml:"provider"` // anthropic | deepseek | kimi
+	Model    string `yaml:"model"`
 }
 
 type GiteaConfig struct {
