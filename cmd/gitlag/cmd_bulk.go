@@ -218,7 +218,7 @@ func bulkImpl(configPath string, noFetch bool, format, source string, targets []
 
 				lastDate, lastAuthor := parseBranchInfo(branchInfo)
 
-				contentSynced := false
+				contentSynced := cmpr.AheadBy == 0 && cmpr.EmptyBehindDiff
 				squashMerged := false
 
 				info := DivergenceInfo{

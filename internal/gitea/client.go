@@ -142,8 +142,9 @@ func (c *Client) GetRepoURL(org, repoName string) string {
 // AheadBy = commits in source that target does NOT have (source unique).
 // BehindBy = commits in target that source does NOT have (target unique).
 type CompareResult struct {
-	AheadBy  int
-	BehindBy int
+	AheadBy      int
+	BehindBy     int
+	EmptyBehindDiff bool // true when BehindBy>0 but target introduces no file changes vs source
 }
 
 // CompareBranches uses the Gitea compare API to get accurate ahead/behind counts
@@ -158,7 +159,7 @@ func (c *Client) CompareBranches(owner, repo, source, target string) (*CompareRe
 		return nil, nil
 	}
 
-	behind, err := c.totalCommits(owner, repo, source, target)
+	behind, behindFiles, err := c.totalCommitsAndFiles(owner, repo, source, target)
 	if err != nil {
 		return nil, err
 	}
@@ -166,43 +167,52 @@ func (c *Client) CompareBranches(owner, repo, source, target string) (*CompareRe
 		return nil, nil
 	}
 
-	return &CompareResult{AheadBy: ahead, BehindBy: behind}, nil
+	emptyBehindDiff := behind > 0 && behindFiles == 0
+	return &CompareResult{AheadBy: ahead, BehindBy: behind, EmptyBehindDiff: emptyBehindDiff}, nil
 }
 
 // totalCommits calls compare/{base}...{head} and returns total_commits.
 // Returns -1 if the endpoint returns 404 (branch missing).
 func (c *Client) totalCommits(owner, repo, base, head string) (int, error) {
+	n, _, err := c.totalCommitsAndFiles(owner, repo, base, head)
+	return n, err
+}
+
+// totalCommitsAndFiles calls compare/{base}...{head} and returns (total_commits, file_count).
+// Returns (-1, 0, nil) if the endpoint returns 404 (branch missing).
+func (c *Client) totalCommitsAndFiles(owner, repo, base, head string) (int, int, error) {
 	endpoint := fmt.Sprintf("%s/api/v1/repos/%s/%s/compare/%s...%s",
 		c.baseURL, owner, repo, base, head)
 
 	req, err := http.NewRequest("GET", endpoint, nil)
 	if err != nil {
-		return 0, fmt.Errorf("create request: %w", err)
+		return 0, 0, fmt.Errorf("create request: %w", err)
 	}
 	req.Header.Set("Authorization", fmt.Sprintf("token %s", c.token))
 
 	resp, err := c.client.Do(req)
 	if err != nil {
-		return 0, fmt.Errorf("api call: %w", err)
+		return 0, 0, fmt.Errorf("api call: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNotFound {
-		return -1, nil
+		return -1, 0, nil
 	}
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return 0, fmt.Errorf("api error: %d %s", resp.StatusCode, string(body))
+		return 0, 0, fmt.Errorf("api error: %d %s", resp.StatusCode, string(body))
 	}
 
 	var result struct {
-		TotalCommits int `json:"total_commits"`
+		TotalCommits int              `json:"total_commits"`
+		Files        []map[string]any `json:"files"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return 0, fmt.Errorf("decode response: %w", err)
+		return 0, 0, fmt.Errorf("decode response: %w", err)
 	}
 
-	return result.TotalCommits, nil
+	return result.TotalCommits, len(result.Files), nil
 }
 
 // BranchInfo holds the latest commit details returned by the Gitea branch API.
@@ -328,6 +338,15 @@ type PRFile struct {
 	Changes   int    `json:"changes"`
 }
 
+// PRStats holds summary metrics for a pull request diff.
+type PRStats struct {
+	Commits   int
+	Files     int
+	Additions int
+	Deletions int
+	SentBytes int // total bytes sent to the AI (diff + full file content)
+}
+
 // GetPullRequest fetches a single pull request by number.
 func (c *Client) GetPullRequest(owner, repo string, number int) (*PullRequest, error) {
 	endpoint := fmt.Sprintf("%s/api/v1/repos/%s/%s/pulls/%d", c.baseURL, owner, repo, number)
@@ -364,13 +383,13 @@ const maxDiffBytes = 150_000
 // GetPullRequestDiff returns a unified diff for the PR using the true merge base
 // (parent of the oldest PR commit) rather than the base branch tip. This ensures
 // only the commits belonging to this PR are reflected in the diff.
-func (c *Client) GetPullRequestDiff(owner, repo string, number int) (string, error) {
+func (c *Client) GetPullRequestDiff(owner, repo string, number int) (string, PRStats, error) {
 	pr, err := c.GetPullRequest(owner, repo, number)
 	if err != nil {
-		return "", err
+		return "", PRStats{}, err
 	}
 
-	mergeBase, err := c.prMergeBase(owner, repo, number)
+	mergeBase, commitCount, err := c.prMergeBase(owner, repo, number)
 	if err != nil {
 		// Fall back to base branch SHA if merge base lookup fails
 		mergeBase = pr.Base.SHA
@@ -378,13 +397,27 @@ func (c *Client) GetPullRequestDiff(owner, repo string, number int) (string, err
 
 	files, err := c.listPRFiles(owner, repo, number)
 	if err != nil {
-		return "", err
+		return "", PRStats{}, err
+	}
+
+	stats := PRStats{
+		Commits: commitCount,
+		Files:   len(files),
+	}
+	for _, f := range files {
+		stats.Additions += f.Additions
+		stats.Deletions += f.Deletions
 	}
 
 	var sb strings.Builder
 	totalBytes := 0
 
 	for _, f := range files {
+		if totalBytes >= maxDiffBytes {
+			sb.WriteString("\n[remaining files omitted — 150 KB budget reached]\n")
+			break
+		}
+
 		var baseContent, headContent string
 
 		if f.Status != "added" {
@@ -394,48 +427,48 @@ func (c *Client) GetPullRequestDiff(owner, repo string, number int) (string, err
 			headContent, _ = c.rawFileContent(owner, repo, pr.Head.SHA, f.Filename)
 		}
 
-		fileDiff := buildUnifiedDiff(f.Filename, baseContent, headContent)
-
-		// Emit diff (what changed) followed by the full HEAD file (full context).
-		section := fileDiff
-		if headContent != "" {
-			section += fmt.Sprintf("\n// full file: %s\n%s\n", f.Filename, headContent)
+		fileDiff := buildUnifiedDiff(f.Filename, baseContent, headContent, 3)
+		if fileDiff == "" && headContent == "" {
+			continue
 		}
 
-		if section == "" {
-			continue
+		section := fileDiff
+		remaining := maxDiffBytes - totalBytes - len(fileDiff)
+		if headContent != "" {
+			if len(headContent) <= remaining {
+				section += fmt.Sprintf("\n// full file: %s\n%s\n", f.Filename, headContent)
+			} else {
+				section += fmt.Sprintf("\n// full file: %s [omitted — %d bytes exceeds remaining budget]\n", f.Filename, len(headContent))
+			}
 		}
 
 		sb.WriteString(section)
 		totalBytes += len(section)
-
-		if totalBytes >= maxDiffBytes {
-			sb.WriteString("\n[diff truncated — exceeds 150 KB]\n")
-			break
-		}
 	}
 
-	return sb.String(), nil
+	stats.SentBytes = totalBytes
+	return sb.String(), stats, nil
 }
 
-// prMergeBase returns the SHA of the common ancestor (merge base) for the PR.
+// prMergeBase returns the SHA of the common ancestor (merge base) for the PR
+// and the number of commits in the PR.
 // It fetches the PR's commit list (newest-first) and returns the parent of the oldest commit.
-func (c *Client) prMergeBase(owner, repo string, number int) (string, error) {
+func (c *Client) prMergeBase(owner, repo string, number int) (sha string, commitCount int, err error) {
 	endpoint := fmt.Sprintf("%s/api/v1/repos/%s/%s/pulls/%d/commits", c.baseURL, owner, repo, number)
 	req, err := http.NewRequest("GET", endpoint, nil)
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 	req.Header.Set("Authorization", fmt.Sprintf("token %s", c.token))
 
 	resp, err := c.client.Do(req)
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("commits: %d", resp.StatusCode)
+		return "", 0, fmt.Errorf("commits: %d", resp.StatusCode)
 	}
 
 	var commits []struct {
@@ -445,18 +478,18 @@ func (c *Client) prMergeBase(owner, repo string, number int) (string, error) {
 		} `json:"parents"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&commits); err != nil {
-		return "", err
+		return "", 0, err
 	}
 	if len(commits) == 0 {
-		return "", fmt.Errorf("no commits in PR")
+		return "", 0, fmt.Errorf("no commits in PR")
 	}
 
 	// Commits are newest-first; oldest is last.
 	oldest := commits[len(commits)-1]
 	if len(oldest.Parents) == 0 {
-		return "", fmt.Errorf("oldest commit has no parent")
+		return "", len(commits), fmt.Errorf("oldest commit has no parent")
 	}
-	return oldest.Parents[0].SHA, nil
+	return oldest.Parents[0].SHA, len(commits), nil
 }
 
 // listPRFiles returns changed files for a PR via the Gitea API.
@@ -502,9 +535,13 @@ func (c *Client) rawFileContent(owner, repo, sha, filepath string) (string, erro
 		return "", fmt.Errorf("raw fetch %d", resp.StatusCode)
 	}
 
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 50_000))
+	const fileLimit = 200_000
+	data, err := io.ReadAll(io.LimitReader(resp.Body, fileLimit+1))
 	if err != nil {
 		return "", err
+	}
+	if len(data) > fileLimit {
+		return string(data[:fileLimit]) + "\n// [file truncated at 200 KB — remainder omitted]\n", nil
 	}
 	return string(data), nil
 }
