@@ -226,6 +226,7 @@ func bulkImpl(configPath string, noFetch bool, format, source string, targets []
 					BehindCount:     cmpr.BehindBy,
 					IsContentSynced: contentSynced,
 					IsSquashMerged:  squashMerged,
+					EmptyBehindDiff: cmpr.EmptyBehindDiff,
 					LastDate:        lastDate,
 					LastAuthor:       lastAuthor,
 				}
@@ -489,7 +490,7 @@ func outputBulkTable(results []BulkResult, source string, targets []string) {
 					colored += fmt.Sprintf("%s%s%s", colorYellow, val, colorReset)
 					visible += len([]rune(val))
 				}
-				if comp.Info.BehindCount > 0 {
+				if comp.Info.BehindCount > 0 && !comp.Info.EmptyBehindDiff {
 					if colored != "" {
 						colored += " "
 						visible += 1

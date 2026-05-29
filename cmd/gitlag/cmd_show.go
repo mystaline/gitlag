@@ -29,6 +29,7 @@ type DivergenceInfo struct {
 	BehindCount     int    `json:"behind"`
 	IsContentSynced bool   `json:"in_sync"`
 	IsSquashMerged  bool   `json:"squash_merged"`
+	EmptyBehindDiff bool   `json:"empty_behind_diff"`
 	LastDate        string `json:"last_date"`
 	LastAuthor      string `json:"last_author"`
 }
