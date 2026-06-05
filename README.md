@@ -274,3 +274,7 @@ gitlag figures out parent branches automatically:
 ## License
 
 MIT
+---
+
+**[→ mystaline.dev](https://mystaline.dev)** — full portfolio & project writeups
+
