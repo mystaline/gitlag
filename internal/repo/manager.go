@@ -72,26 +72,22 @@ func (m *Manager) syncRepo(r gitea.Repository, noFetch bool) error {
 		return nil
 	}
 
-	branch := r.DefaultBranch
-	if branch == "" {
-		branch = "main"
-	}
+	// Fetch and reset the currently checked-out branch, not the default branch.
+	// The cache dir is shared with local development — a hard reset to
+	// origin/main while another branch is checked out causes divergence.
+	currentBranch := getCurrentBranch(dest)
+	if currentBranch != "HEAD" {
+		fetch := exec.Command("git", "-C", dest, "fetch", "--depth=1", "--quiet", "origin", currentBranch)
+		fetch.Env = m.env
+		fetch.Stdout = nil
+		fetch.Stderr = nil
+		_ = fetch.Run() // best-effort
 
-	// Fetch default branch
-	fetch := exec.Command("git", "-C", dest, "fetch", "--depth=1", "--quiet", "origin", branch)
-	fetch.Env = m.env
-	fetch.Stdout = nil
-	fetch.Stderr = nil
-	if err := fetch.Run(); err != nil {
-		return fmt.Errorf("git fetch: %w", err)
-	}
-
-	reset := exec.Command("git", "-C", dest, "reset", "--hard", "--quiet", "origin/"+branch)
-	reset.Env = m.env
-	reset.Stdout = nil
-	reset.Stderr = nil
-	if err := reset.Run(); err != nil {
-		return fmt.Errorf("git reset: %w", err)
+		reset := exec.Command("git", "-C", dest, "reset", "--hard", "--quiet", "origin/"+currentBranch)
+		reset.Env = m.env
+		reset.Stdout = nil
+		reset.Stderr = nil
+		_ = reset.Run() // best-effort
 	}
 
 	// Also fetch all other branches (for gitlag branch divergence analysis)
@@ -333,6 +329,17 @@ func (m *Manager) PrepareForBranches(repoName string, cloneURL string, branches 
 	}
 
 	return dest, nil
+}
+
+// getCurrentBranch returns the currently checked-out branch, or "HEAD" if detached.
+func getCurrentBranch(dest string) string {
+	cmd := exec.Command("git", "-C", dest, "rev-parse", "--abbrev-ref", "HEAD")
+	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	out, err := cmd.Output()
+	if err != nil {
+		return "HEAD"
+	}
+	return strings.TrimSpace(string(out))
 }
 
 // randomSuffix generates a random suffix for temp directories
