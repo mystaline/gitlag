@@ -1,67 +1,82 @@
 # gitlag
 
-See which branches are out of sync, and scan open pull requests — all without cloning a single repo.
+[![Go Version](https://img.shields.io/badge/Go-1.23+-00ADD8?style=flat-square&logo=go)](https://go.dev)
+[![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)](LICENSE)
+[![Stability](https://img.shields.io/badge/Stability-Stable-success?style=flat-square)](#)
+
+Branch divergence and PR orchestration for Gitea — without cloning a single repo.
 
 No disk cache. No shallow-clone bugs. Just Gitea's API doing the heavy lifting.
 
-## What it does
+## Key Features
 
-| Command          | What you get                                                                 |
-| ---------------- | ---------------------------------------------------------------------------- |
-| `gitlag compare` | Per-repo table of commits ahead/behind between branches                      |
-| `gitlag pr`      | All open PRs across your org, who wrote them, and where they're trying to go |
-| `gitlag show`    | Deep dive into one repo's branch divergence                                  |
-| `gitlag review`  | AI-generated code review for a specific pull request                         |
-| `gitlag version` | Print the installed version                                                  |
+- **Zero-Clone Architecture**: All data comes from Gitea's compare API — always accurate, no local sprawl.
+- **Branch Diffing**: Per-repo breakdown of commits ahead/behind between any two branches.
+- **Org-Wide PR Dashboard**: Every open PR across every repo, with color-coded age and word-wrapped titles.
+- ~~**AI Code Review** — use your own coding agent to review PRs instead~~
+- **Multiple Output Formats**: Table (terminal), JSON (scripts), CSV (spreadsheets), Markdown (docs/issues).
+- **Shell Completion**: Native completion for bash, zsh, fish, and PowerShell.
+- **Parent Branch Detection**: Automatic — git upstream, config mapping, naming conventions, fallback to `main`.
+
+## Prerequisites
+
+- **Go 1.23+** and **git**
+- **Gitea** instance with API token (org read + repo read access)
+<details>
+<summary>Where to find your Gitea token</summary>
+
+1. Log into your Gitea instance
+2. Settings → Applications → Manage Access Tokens
+3. Generate a token with `read:repository` and `read:organization` scopes
+4. Set as env var: `export GITEA_TOKEN="your_token_here"`
+</details>
 
 ## Install
 
-One command. Drops the binary into `~/go/bin`:
-
 ```bash
-go install ./cmd/gitlag
+go install github.com/mystaline/gitlag/cmd/gitlag@latest
 ```
 
-Make sure `~/go/bin` is on your `$PATH` — add this to your `.bashrc` or `.zshrc` if it isn't already:
+Or clone and build:
+
+```bash
+git clone https://github.com/mystaline/gitlag.git
+cd gitlag
+make build        # outputs bin/gitlag
+make install      # installs to ~/go/bin
+```
+
+Make sure `~/go/bin` is on your `$PATH`:
 
 ```bash
 export PATH=$HOME/go/bin:$PATH
 ```
 
-Or build locally:
+Works on **Linux**, **macOS**, **Windows** (native and WSL2).
+
+## Quickstart
 
 ```bash
-make build          # → bin/gitlag
-go build -o /wherever/you/want/gitlag ./cmd/gitlag
+# 1. Set your Gitea token
+export GITEA_TOKEN="your_token_here"
+
+# 2. Create config from example
+cp configs/gitlag.example.yaml ~/.gitlag.yaml    # then edit
+
+# 3. See how staging stacks up against dev across all repos
+gitlag compare -s staging --targets dev
+
+# 4. Check open PRs across the org
+gitlag pr
+
+# 5. Deep-dive on one repo's branches
+gitlag show -r backend-api -s staging
+
+# 6. AI review a specific PR (experimental, use your own coding agent instead)
+gitlag review --repo backend-api --pr 42
 ```
 
-## Shell completion
-
-gitlag ships with completion scripts for bash, zsh, fish, and PowerShell via the built-in `completion` command.
-
-**zsh:**
-
-```bash
-gitlag completion zsh > "${fpath[1]}/_gitlag"
-# then restart your shell, or:
-source "${fpath[1]}/_gitlag"
-```
-
-**bash:**
-
-```bash
-gitlag completion bash > /etc/bash_completion.d/gitlag
-# or for a single user:
-gitlag completion bash >> ~/.bashrc && source ~/.bashrc
-```
-
-**fish:**
-
-```bash
-gitlag completion fish > ~/.config/fish/completions/gitlag.fish
-```
-
-## Config
+## Configuration
 
 Drop this at `~/.gitlag.yaml`:
 
@@ -77,20 +92,6 @@ gitea:
       exclude:
         - "*-legacy"
 
-# AI review (optional — only needed for gitlag review)
-ai:
-  provider: deepseek # deepseek | kimi | anthropic | ollama
-  model: deepseek-v4-pro # model name for the chosen provider
-```
-
-API keys are never stored in the config file. Set them as environment variables — add to your `~/.zshrc` or `~/.bashrc`:
-
-```bash
-# Pick the one matching your provider
-export DEEPSEEK_API_KEY="sk-..."
-export MOONSHOT_API_KEY="sk-..."   # for kimi
-export ANTHROPIC_API_KEY="sk-..."
-# ollama needs no key — it runs locally
 ```
 
 See [`configs/gitlag.example.yaml`](configs/gitlag.example.yaml) for a full annotated example.
@@ -99,177 +100,113 @@ See [`configs/gitlag.example.yaml`](configs/gitlag.example.yaml) for a full anno
 
 ### `compare` — who's ahead, who's behind
 
-Pick a source branch, pick one or more targets, and see the gap:
-
-```bash
-gitlag compare -s staging --targets dev
-```
-
-```
-  staging → dev
-┌──────────────────────────────┬─────────┬──────────┐
-│ REPOSITORY                   │ DEV     │   TIME   │
-├──────────────────────────────┼─────────┼──────────┤
-│ backend-api                  │ ↑ 51A ↓ 11B │  6.1s   │
-│ shared-utils                 │ ↑ 51A ↓ 6B  │  5.7s   │
-│ frontend-app                 │ ✔ sync  │  1.0s   │
-└──────────────────────────────┴─────────┴──────────┘
-```
-
-**↑ source ahead** means the source branch has commits the target doesn't. **↓ source behind** means the target has moved on without the source. All counts come straight from Gitea's compare API — zero cloning, always accurate.
-
-Compare against multiple targets at once:
-
 ```bash
 gitlag compare -s staging --targets dev,main,release
 ```
 
-### `pr` — what's waiting for review
+| Icon | Meaning |
+|------|---------|
+| `↑ N ahead` | Source branch has commits the target doesn't |
+| `↓ N behind` | Target has commits the source doesn't |
+| `✔ sync` | Branches are in sync |
 
-See every open PR across every repo, who filed it, and where it's headed:
+![compare output](assets/screenshots/compare.png)
+
+### `pr` — what's waiting for review
 
 ```bash
 gitlag pr
 ```
 
-```
-┌──────┬──────────────────────┬──────────────────────────────────────┬──────────────────────────────┬────────────┬─────┐
-│ PR   │ REPOSITORY           │ TITLE                                │ HEAD → BASE                  │ AUTHOR     │ AGE │
-├──────┼──────────────────────┼──────────────────────────────────────┼──────────────────────────────┼────────────┼─────┤
-│ #42  │ backend-api          │ fix: handle empty response on        │ fix/timeout → staging        │ alice      │ 3d  │
-│      │                      │ timeout                              │                              │            │     │
-│ #17  │ frontend-app         │ feature: add user settings panel     │ feat/settings → dev          │ bob        │ 8d  │
-│ #5   │ shared-utils         │ chore: bump dependencies             │ deps/upgrade → main          │ carol      │ 22d │
-└──────┴──────────────────────┴──────────────────────────────────────┴──────────────────────────────┴────────────┴─────┘
-```
+AGE is color-coded: green ≤ 3 days, yellow ≤ 14 days, red beyond that.
 
-AGE is color-coded: green ≤ 3 days, yellow ≤ 14 days, red beyond that. Long titles word-wrap within their column.
+![pr output](assets/screenshots/pr.png)
 
 ### `show` — single repo detail
-
-How every branch stacks up against a chosen source:
 
 ```bash
 gitlag show -r backend-api -s staging
 ```
 
-```
-Repository: backend-api
-Branch: staging
-Parent: main
+Shows every branch's divergence: `↑ ahead of source`, `↓ behind source`, `✓ synced`.
 
-Each branch compared to staging:
-  BRANCH                         DIVERGENCE
-  dev                   ↑ 88 ahead of source   ↓ 1 behind source   2026-04-23
-  feat/user-settings    ↑ 157 ahead of source                       2026-03-31
-  hotfix/login-timeout  ↓ 12 behind source                          2026-05-11
-  main                  ↓ 51 behind source                          2026-01-15
-  release               ✓ synced                                    2026-02-10
-```
+![show output](assets/screenshots/show.png)
 
-Every line reads like plain English — `↑ ahead of source` means that branch has commits staging doesn't, `↓ behind source` means staging has moved past it.
+### ~~`review` — AI code review (strikethrough, use your own coding agent)~~
 
-### `review` — AI code review for a PR
-
-Point it at any open PR and get a streamed review scoped to the exact commits in the PR:
-
-```bash
-gitlag review --repo backend-api --pr 42
-```
-
-```
- 🔍 Fetching PR #42 from my-org/backend-api...
- 📄 Fetching diff...
- 🤖 Reviewing with deepseek / deepseek-v4-pro...
-
-╔══════════════════════════════════════════════════════════════╗
-║ fix: handle empty response on timeout
-║ fix/timeout → staging  by alice
-╚══════════════════════════════════════════════════════════════╝
-
-## Goal Summary
-...
-
-## Key Changes
-...
-
-## Code Review
-...
-
-## Verdict
-⚠️ Minor concerns
-```
-
-The diff is computed against the true merge base — not the tip of the base branch — so the review only covers what the PR actually introduces.
-
-If the org can't be inferred from your config, pass it explicitly:
-
-```bash
-gitlag review --repo backend-api --pr 42 --org my-org
-```
-
-### `version` — print the installed version
+### `version`
 
 ```bash
 gitlag version
-# gitlag v1.0.2
 ```
 
 ### Flags
 
-| Flag            | Scope        | What it does                                   |
-| --------------- | ------------ | ---------------------------------------------- |
-| `--config`      | global       | Path to config file (default `~/.gitlag.yaml`) |
-| `--format`      | global       | `table` (default), `json`, `csv`, `markdown`   |
-| `-s, --source`  | compare/show | Which branch you're comparing _from_           |
-| `-t, --targets` | compare      | Comma-separated target branches                |
-| `-r, --repo`    | show/review  | Repository name                                |
-| `-n, --pr`      | review       | Pull request number                            |
-| `--org`         | review       | Organization (optional, auto-detected)         |
+| Flag            | Scope        | Description                                       |
+| --------------- | ------------ | ------------------------------------------------- |
+| `--config`      | global       | Config path (default `~/.gitlag.yaml`)            |
+| `--format`      | global       | Output: `table` (default), `json`, `csv`, `markdown` |
+| `-s, --source`  | compare/show | Source branch to compare from                     |
+| `-t, --targets` | compare      | Comma-separated target branches                   |
+| `-r, --repo`    | show/review  | Repository name                                   |
+| `-n, --pr`      | review       | Pull request number (strikethrough — see note)    |
+| `--org`         | review       | Organization (optional, auto-detected)            |
+
+> ~~review command — use your own coding agent to review PRs instead~~
 
 ### Output formats
 
-All commands that produce tabular data support `--format`:
-
-| Format     | Best for                                    |
-| ---------- | ------------------------------------------- |
-| `table`    | Terminal — colored, aligned, word-wrapped   |
-| `json`     | Scripts, `jq` pipelines, CI output          |
-| `csv`      | Spreadsheets, Excel, Google Sheets          |
-| `markdown` | Paste into PR comments, wikis, Gitea issues |
-
-Examples:
-
 ```bash
-# export stale PRs to a spreadsheet
 gitlag pr --format csv > prs.csv
-
-# pipe into jq
 gitlag pr --format json | jq '[.[] | select(.age_days > 14)]'
-
-# generate a markdown report for a PR comment
 gitlag compare -s staging --targets dev --format markdown
 ```
 
-## How it works
+## Shell completion
 
-No local clones. No disk sprawl. No shallow-clone bugs inflating your counts.
+**zsh:**
+```bash
+gitlag completion zsh > "${fpath[1]}/_gitlag" && source "${fpath[1]}/_gitlag"
+```
 
-Every count comes from the Gitea compare API — the server has the full commit history, so the numbers are always right. Ghost detection (squash merges, identical trees) is available as a future opt-in for repos that look ahead but are actually caught up.
+**bash:**
+```bash
+gitlag completion bash >> ~/.bashrc && source ~/.bashrc
+```
 
-## Parent branch detection
+**fish:**
+```bash
+gitlag completion fish > ~/.config/fish/completions/gitlag.fish
+```
 
-gitlag figures out parent branches automatically:
+## Testing
 
-1. **Git upstream** — if the branch already tracks something, use that
-2. **Config mapping** — `branch_parents` in your config (glob-friendly)
-3. **Naming convention**:
-   - `feature/*` → `dev`
-   - `fix/*` → `staging`
-   - `hotfix/*` → `main`
-   - `dev*` → `staging`
-   - `staging` → `main`
-4. **Default** → `main`
+```bash
+go test ./...              # full suite
+go test ./... -v           # verbose
+go test ./... -cover       # with coverage
+```
+
+## Troubleshooting
+
+| Problem | Likely cause | Fix |
+|---------|-------------|-----|
+| `401 Unauthorized` on all requests | Missing or invalid `GITEA_TOKEN` | Set `export GITEA_TOKEN=...` and verify token has `read:repository` + `read:organization` scopes |
+| `no repositories found` | Config org name wrong, or `include` pattern matches nothing | Check org spelling and glob patterns in config |
+| Config not found | File named `.gitlag.yaml` vs `gitlag.yaml` | Try `--config ~/.gitlag.yaml` |
+| AI review returns nothing | Missing API key or wrong provider/model | Check your `DEEPSEEK_API_KEY` (or equivalent) and `ai.provider`/`ai.model` in config |
+| `compare` shows no data | Source branch doesn't exist in one or more repos | Verify branch name across all tracked repos |
+| <code>review</code> unreliable | AI model quality varies | Use your own coding agent instead |
+
+## Roadmap
+
+- [ ] **GitHub / GitLab / Bitbucket** — native API providers beyond Gitea. (worth: high, effort: medium)
+- [ ] **Ghost commit detection** — squash-merge and rebase detection for accurate divergence counts. (worth: high, effort: low)
+- [ ] ~~**Webhook mode** — listen for PR events, auto-review, post results as PR comments. (worth: medium, effort: medium)~~
+- [ ] ~~**Review caching** — skip re-review of unchanged PR diffs. (worth: medium, effort: low)~~
+- [ ] ~~**Concurrent review** — batch-review multiple PRs in one pass. (worth: medium, effort: low)~~
+- [ ] ~~**Visual dashboard** — web UI for org-wide branch health. (worth: low, effort: high)~~
+- [ ] ~~**Slack integration** — post stale PR alerts to channels. (worth: low, effort: medium)~~
 
 ## License
 
@@ -277,4 +214,3 @@ MIT
 ---
 
 **[→ mystaline.dev](https://mystaline.dev)** — full portfolio & project writeups
-
