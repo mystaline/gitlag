@@ -1,10 +1,14 @@
 package gitea
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 )
@@ -23,15 +27,66 @@ type Client struct {
 	client  *http.Client
 }
 
-func NewClient(baseURL, token, org string) *Client {
+func NewClient(baseURL, token, org string, timeout ...time.Duration) *Client {
+	t := 30 * time.Second
+	if len(timeout) > 0 && timeout[0] > 0 {
+		t = timeout[0]
+	}
+
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.DialContext = (&net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}).DialContext
+	transport.TLSHandshakeTimeout = 10 * time.Second
+	transport.ResponseHeaderTimeout = 10 * time.Second
+	transport.ExpectContinueTimeout = 2 * time.Second
+
+	if certFile := os.Getenv("SSL_CERT_FILE"); certFile != "" {
+		if pem, err := os.ReadFile(certFile); err == nil {
+			pool := x509.NewCertPool()
+			if pool.AppendCertsFromPEM(pem) {
+				transport.TLSClientConfig = &tls.Config{RootCAs: pool}
+			}
+		}
+	}
 	return &Client{
 		baseURL: strings.TrimSuffix(baseURL, "/"),
 		token:   token,
 		org:     org,
 		client: &http.Client{
-			Timeout: 30 * time.Second,
+			Timeout:   t,
+			Transport: transport,
 		},
 	}
+}
+
+// doGet performs a GET request with retries for transient failures.
+// Creates a fresh *http.Request per attempt (required: reusing across Client.Do is deprecated).
+func (c *Client) doGet(endpoint string) (*http.Response, error) {
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
+		}
+		req, err := http.NewRequest("GET", endpoint, nil)
+		if err != nil {
+			return nil, fmt.Errorf("create request: %w", err)
+		}
+		req.Header.Set("Authorization", fmt.Sprintf("token %s", c.token))
+
+		resp, err := c.client.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if resp.StatusCode < 500 {
+			return resp, nil
+		}
+		resp.Body.Close()
+		lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	return nil, lastErr
 }
 
 func (c *Client) ListOrgRepos(orgs ...string) ([]Repository, error) {
@@ -63,14 +118,7 @@ func (c *Client) ListOrgRepos(orgs ...string) ([]Repository, error) {
 func (c *Client) listPageOrg(org string, page int) ([]Repository, bool, error) {
 	endpoint := fmt.Sprintf("%s/api/v1/orgs/%s/repos?limit=50&page=%d", c.baseURL, org, page)
 
-	req, err := http.NewRequest("GET", endpoint, nil)
-	if err != nil {
-		return nil, false, fmt.Errorf("create request: %w", err)
-	}
-
-	req.Header.Set("Authorization", fmt.Sprintf("token %s", c.token))
-
-	resp, err := c.client.Do(req)
+	resp, err := c.doGet(endpoint)
 	if err != nil {
 		return nil, false, fmt.Errorf("api call: %w", err)
 	}
@@ -142,16 +190,37 @@ func (c *Client) GetRepoURL(org, repoName string) string {
 // AheadBy = commits in source that target does NOT have (source unique).
 // BehindBy = commits in target that source does NOT have (target unique).
 type CompareResult struct {
-	AheadBy      int
-	BehindBy     int
-	EmptyBehindDiff bool // true when BehindBy>0 but target introduces no file changes vs source
+	AheadBy           int
+	BehindBy          int
+	AheadAdditions    int
+	AheadDeletions    int
+	BehindAdditions   int
+	BehindDeletions   int
+	EmptyAheadDiff    bool // true when AheadBy>0 but source introduces no file changes vs target
+	EmptyBehindDiff   bool // true when BehindBy>0 but target introduces no file changes vs source
+}
+
+type compareFile struct {
+	Additions int    `json:"additions"`
+	Deletions int    `json:"deletions"`
+	Filename  string `json:"filename"`
+}
+
+type commitStats struct {
+	Additions int `json:"additions"`
+	Deletions int `json:"deletions"`
 }
 
 // CompareBranches uses the Gitea compare API to get accurate ahead/behind counts
 // without requiring a local clone. source and target are branch names (without origin/ prefix).
 // Returns nil, nil if either comparison endpoint returns 404 (branch missing).
+//
+// Empty diff detection uses tree SHA comparison as the authoritative source.
+// Individual commit stats can be non-zero for merge commits that bring no net
+// file changes, so tree comparison is the only reliable way to detect
+// empty diffs.
 func (c *Client) CompareBranches(owner, repo, source, target string) (*CompareResult, error) {
-	ahead, err := c.totalCommits(owner, repo, target, source)
+	ahead, aheadAdd, aheadDel, _, err := c.compareOneWay(owner, repo, target, source)
 	if err != nil {
 		return nil, err
 	}
@@ -159,7 +228,7 @@ func (c *Client) CompareBranches(owner, repo, source, target string) (*CompareRe
 		return nil, nil
 	}
 
-	behind, behindFiles, err := c.totalCommitsAndFiles(owner, repo, source, target)
+	behind, behindAdd, behindDel, _, err := c.compareOneWay(owner, repo, source, target)
 	if err != nil {
 		return nil, err
 	}
@@ -167,52 +236,153 @@ func (c *Client) CompareBranches(owner, repo, source, target string) (*CompareRe
 		return nil, nil
 	}
 
-	emptyBehindDiff := behind > 0 && behindFiles == 0
-	return &CompareResult{AheadBy: ahead, BehindBy: behind, EmptyBehindDiff: emptyBehindDiff}, nil
+	emptyAheadDiff := false
+	emptyBehindDiff := false
+
+	if ahead > 0 || behind > 0 {
+		same, err := c.compareContent(owner, repo, source, target)
+		if err == nil && same {
+			emptyAheadDiff = ahead > 0
+			emptyBehindDiff = behind > 0
+		} else if err != nil {
+			// compareContent failed — fall back to commit-level stats
+			emptyAheadDiff = ahead > 0 && aheadAdd == 0 && aheadDel == 0
+			emptyBehindDiff = behind > 0 && behindAdd == 0 && behindDel == 0
+		}
+	}
+
+	return &CompareResult{
+		AheadBy: ahead, BehindBy: behind,
+		AheadAdditions: aheadAdd, AheadDeletions: aheadDel,
+		BehindAdditions: behindAdd, BehindDeletions: behindDel,
+		EmptyAheadDiff: emptyAheadDiff, EmptyBehindDiff: emptyBehindDiff,
+	}, nil
 }
 
-// totalCommits calls compare/{base}...{head} and returns total_commits.
-// Returns -1 if the endpoint returns 404 (branch missing).
-func (c *Client) totalCommits(owner, repo, base, head string) (int, error) {
-	n, _, err := c.totalCommitsAndFiles(owner, repo, base, head)
-	return n, err
+// compareContent returns true if both branches have identical content.
+// Uses recursive tree comparison since Gitea's commit.tree.sha is unreliable
+// (returns commit SHA, not tree SHA, for some commit objects).
+func (c *Client) compareContent(owner, repo, branchA, branchB string) (bool, error) {
+	infoA, err := c.GetBranchInfo(owner, repo, branchA)
+	if err != nil || infoA == nil {
+		return false, fmt.Errorf("get branch %s: %w", branchA, err)
+	}
+	infoB, err := c.GetBranchInfo(owner, repo, branchB)
+	if err != nil || infoB == nil {
+		return false, fmt.Errorf("get branch %s: %w", branchB, err)
+	}
+
+	// Same commit SHA → same content
+	if infoA.Commit.ID == infoB.Commit.ID {
+		return true, nil
+	}
+
+	shaA := infoA.Commit.ID
+	shaB := infoB.Commit.ID
+
+	endpointA := fmt.Sprintf("%s/api/v1/repos/%s/%s/git/trees/%s?recursive=1", c.baseURL, owner, repo, shaA)
+	endpointB := fmt.Sprintf("%s/api/v1/repos/%s/%s/git/trees/%s?recursive=1", c.baseURL, owner, repo, shaB)
+
+	var fetchTree = func(endpoint string) ([]map[string]any, error) {
+		resp, err := c.doGet(endpoint)
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(resp.Body)
+			return nil, fmt.Errorf("tree api: %d %s", resp.StatusCode, string(body))
+		}
+		var result struct {
+			Tree []map[string]any `json:"tree"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			return nil, err
+		}
+		return result.Tree, nil
+	}
+
+	treeA, err := fetchTree(endpointA)
+	if err != nil {
+		return false, err
+	}
+	treeB, err := fetchTree(endpointB)
+	if err != nil {
+		return false, err
+	}
+
+	if len(treeA) != len(treeB) {
+		return false, nil
+	}
+
+	setB := make(map[string]string, len(treeB))
+	for _, e := range treeB {
+		path, _ := e["path"].(string)
+		mode, _ := e["mode"].(string)
+		typ, _ := e["type"].(string)
+		sha, _ := e["sha"].(string)
+		setB[path+"|"+mode+"|"+typ] = sha
+	}
+
+	for _, e := range treeA {
+		path, _ := e["path"].(string)
+		mode, _ := e["mode"].(string)
+		typ, _ := e["type"].(string)
+		sha, _ := e["sha"].(string)
+		shaB, ok := setB[path+"|"+mode+"|"+typ]
+		if !ok || shaB != sha {
+			return false, nil
+		}
+	}
+
+	return true, nil
 }
 
-// totalCommitsAndFiles calls compare/{base}...{head} and returns (total_commits, file_count).
-// Returns (-1, 0, nil) if the endpoint returns 404 (branch missing).
-func (c *Client) totalCommitsAndFiles(owner, repo, base, head string) (int, int, error) {
+// compareOneWay calls compare/{base}...{head} and returns (total_commits, additions, deletions, file_count).
+// Returns (-1, 0, 0, 0, nil) if the endpoint returns 404 (branch missing).
+func (c *Client) compareOneWay(owner, repo, base, head string) (int, int, int, int, error) {
 	endpoint := fmt.Sprintf("%s/api/v1/repos/%s/%s/compare/%s...%s",
 		c.baseURL, owner, repo, base, head)
 
-	req, err := http.NewRequest("GET", endpoint, nil)
+	resp, err := c.doGet(endpoint)
 	if err != nil {
-		return 0, 0, fmt.Errorf("create request: %w", err)
-	}
-	req.Header.Set("Authorization", fmt.Sprintf("token %s", c.token))
-
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return 0, 0, fmt.Errorf("api call: %w", err)
+		return 0, 0, 0, 0, fmt.Errorf("api call: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusNotFound {
-		return -1, 0, nil
+		return -1, 0, 0, 0, nil
 	}
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return 0, 0, fmt.Errorf("api error: %d %s", resp.StatusCode, string(body))
+		return 0, 0, 0, 0, fmt.Errorf("api error: %d %s", resp.StatusCode, string(body))
 	}
 
 	var result struct {
-		TotalCommits int              `json:"total_commits"`
-		Files        []map[string]any `json:"files"`
+		TotalCommits int             `json:"total_commits"`
+		Commits      []struct {
+			Stats commitStats `json:"stats"`
+			Files []struct {
+				Filename string `json:"filename"`
+			} `json:"files"`
+		} `json:"commits"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return 0, 0, fmt.Errorf("decode response: %w", err)
+		return 0, 0, 0, 0, fmt.Errorf("decode response: %w", err)
 	}
 
-	return result.TotalCommits, len(result.Files), nil
+	additions := 0
+	deletions := 0
+	fileSet := make(map[string]bool)
+	for _, c := range result.Commits {
+		additions += c.Stats.Additions
+		deletions += c.Stats.Deletions
+		for _, f := range c.Files {
+			fileSet[f.Filename] = true
+		}
+	}
+
+	return result.TotalCommits, additions, deletions, len(fileSet), nil
 }
 
 // BranchInfo holds the latest commit details returned by the Gitea branch API.
@@ -233,13 +403,7 @@ func (c *Client) GetBranchInfo(owner, repo, branch string) (*BranchInfo, error) 
 	endpoint := fmt.Sprintf("%s/api/v1/repos/%s/%s/branches/%s",
 		c.baseURL, owner, repo, branch)
 
-	req, err := http.NewRequest("GET", endpoint, nil)
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
-	}
-	req.Header.Set("Authorization", fmt.Sprintf("token %s", c.token))
-
-	resp, err := c.client.Do(req)
+	resp, err := c.doGet(endpoint)
 	if err != nil {
 		return nil, fmt.Errorf("api call: %w", err)
 	}
@@ -269,13 +433,7 @@ func (c *Client) ListBranches(owner, repo string) ([]string, error) {
 		endpoint := fmt.Sprintf("%s/api/v1/repos/%s/%s/branches?limit=50&page=%d",
 			c.baseURL, owner, repo, page)
 
-		req, err := http.NewRequest("GET", endpoint, nil)
-		if err != nil {
-			return nil, fmt.Errorf("create request: %w", err)
-		}
-		req.Header.Set("Authorization", fmt.Sprintf("token %s", c.token))
-
-		resp, err := c.client.Do(req)
+		resp, err := c.doGet(endpoint)
 		if err != nil {
 			return nil, fmt.Errorf("api call: %w", err)
 		}
@@ -351,13 +509,7 @@ type PRStats struct {
 func (c *Client) GetPullRequest(owner, repo string, number int) (*PullRequest, error) {
 	endpoint := fmt.Sprintf("%s/api/v1/repos/%s/%s/pulls/%d", c.baseURL, owner, repo, number)
 
-	req, err := http.NewRequest("GET", endpoint, nil)
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
-	}
-	req.Header.Set("Authorization", fmt.Sprintf("token %s", c.token))
-
-	resp, err := c.client.Do(req)
+	resp, err := c.doGet(endpoint)
 	if err != nil {
 		return nil, fmt.Errorf("api call: %w", err)
 	}
@@ -427,7 +579,7 @@ func (c *Client) GetPullRequestDiff(owner, repo string, number int) (string, PRS
 			headContent, _ = c.rawFileContent(owner, repo, pr.Head.SHA, f.Filename)
 		}
 
-		fileDiff := buildUnifiedDiff(f.Filename, baseContent, headContent, 3)
+		fileDiff := buildUnifiedDiff(f.Filename, baseContent, headContent)
 		if fileDiff == "" && headContent == "" {
 			continue
 		}
@@ -455,13 +607,7 @@ func (c *Client) GetPullRequestDiff(owner, repo string, number int) (string, PRS
 // It fetches the PR's commit list (newest-first) and returns the parent of the oldest commit.
 func (c *Client) prMergeBase(owner, repo string, number int) (sha string, commitCount int, err error) {
 	endpoint := fmt.Sprintf("%s/api/v1/repos/%s/%s/pulls/%d/commits", c.baseURL, owner, repo, number)
-	req, err := http.NewRequest("GET", endpoint, nil)
-	if err != nil {
-		return "", 0, err
-	}
-	req.Header.Set("Authorization", fmt.Sprintf("token %s", c.token))
-
-	resp, err := c.client.Do(req)
+	resp, err := c.doGet(endpoint)
 	if err != nil {
 		return "", 0, err
 	}
@@ -495,13 +641,7 @@ func (c *Client) prMergeBase(owner, repo string, number int) (sha string, commit
 // listPRFiles returns changed files for a PR via the Gitea API.
 func (c *Client) listPRFiles(owner, repo string, number int) ([]PRFile, error) {
 	endpoint := fmt.Sprintf("%s/api/v1/repos/%s/%s/pulls/%d/files", c.baseURL, owner, repo, number)
-	req, err := http.NewRequest("GET", endpoint, nil)
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
-	}
-	req.Header.Set("Authorization", fmt.Sprintf("token %s", c.token))
-
-	resp, err := c.client.Do(req)
+	resp, err := c.doGet(endpoint)
 	if err != nil {
 		return nil, fmt.Errorf("api call: %w", err)
 	}
@@ -554,13 +694,7 @@ func (c *Client) ListPullRequests(owner, repo string) ([]PullRequest, error) {
 		endpoint := fmt.Sprintf("%s/api/v1/repos/%s/%s/pulls?state=open&limit=50&page=%d",
 			c.baseURL, owner, repo, page)
 
-		req, err := http.NewRequest("GET", endpoint, nil)
-		if err != nil {
-			return nil, fmt.Errorf("create request: %w", err)
-		}
-		req.Header.Set("Authorization", fmt.Sprintf("token %s", c.token))
-
-		resp, err := c.client.Do(req)
+		resp, err := c.doGet(endpoint)
 		if err != nil {
 			return nil, fmt.Errorf("api call: %w", err)
 		}

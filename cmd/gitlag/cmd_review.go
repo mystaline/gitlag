@@ -36,7 +36,7 @@ func runReview(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	client := gitea.NewClient(cfg.Gitea.URL, cfg.Gitea.Token, org)
+	client := gitea.NewClient(cfg.Gitea.URL, cfg.Gitea.Token, org, cfg.Gitea.Timeout)
 
 	fmt.Printf("\n%s 🔍 Fetching PR #%d from %s/%s...%s\n", colorCyan, prNumber, org, repoName, colorReset)
 	pr, err := client.GetPullRequest(org, repoName, prNumber)
@@ -45,7 +45,7 @@ func runReview(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Printf("%s 📄 Fetching diff...%s\n", colorCyan, colorReset)
-	diff, err := client.GetPullRequestDiff(org, repoName, prNumber)
+	diff, _, err := client.GetPullRequestDiff(org, repoName, prNumber)
 	if err != nil {
 		return fmt.Errorf("fetch diff: %w", err)
 	}

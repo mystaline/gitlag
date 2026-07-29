@@ -25,13 +25,18 @@ type ScanResult struct {
 }
 
 type DivergenceInfo struct {
-	AheadCount      int    `json:"ahead"`
-	BehindCount     int    `json:"behind"`
-	IsContentSynced bool   `json:"in_sync"`
-	IsSquashMerged  bool   `json:"squash_merged"`
-	EmptyBehindDiff bool   `json:"empty_behind_diff"`
-	LastDate        string `json:"last_date"`
-	LastAuthor      string `json:"last_author"`
+	AheadCount       int    `json:"ahead"`
+	BehindCount      int    `json:"behind"`
+	AheadAdditions   int    `json:"ahead_additions"`
+	AheadDeletions   int    `json:"ahead_deletions"`
+	BehindAdditions  int    `json:"behind_additions"`
+	BehindDeletions  int    `json:"behind_deletions"`
+	IsContentSynced  bool   `json:"in_sync"`
+	IsSquashMerged   bool   `json:"squash_merged"`
+	EmptyAheadDiff   bool   `json:"empty_ahead_diff"`
+	EmptyBehindDiff  bool   `json:"empty_behind_diff"`
+	LastDate         string `json:"last_date"`
+	LastAuthor       string `json:"last_author"`
 }
 
 func showImpl(configPath string, noFetch bool, format, repoName, source string) error {
@@ -45,7 +50,7 @@ func showImpl(configPath string, noFetch bool, format, repoName, source string) 
 
 	var targetOrg string
 	orgs := cfg.GetOrgs()
-	client := gitea.NewClient(cfg.Gitea.URL, cfg.Gitea.Token, orgs[0])
+	client := gitea.NewClient(cfg.Gitea.URL, cfg.Gitea.Token, orgs[0], cfg.Gitea.Timeout)
 
 	for _, repoConfig := range cfg.Gitea.Repos {
 		orgRepos, err := client.ListOrgRepos(repoConfig.Org)
@@ -66,7 +71,7 @@ func showImpl(configPath string, noFetch bool, format, repoName, source string) 
 		return fmt.Errorf("repo not found in any configured org: %s", repoName)
 	}
 
-	repoClient := gitea.NewClient(cfg.Gitea.URL, cfg.Gitea.Token, targetOrg)
+	repoClient := gitea.NewClient(cfg.Gitea.URL, cfg.Gitea.Token, targetOrg, cfg.Gitea.Timeout)
 
 	branches, err := repoClient.ListBranches(targetOrg, repoName)
 	if err != nil {
@@ -106,7 +111,11 @@ func showImpl(configPath string, noFetch bool, format, repoName, source string) 
 			defer func() { <-sem }()
 
 			cmpr, apiErr := repoClient.CompareBranches(targetOrg, repoName, source, target)
-			if apiErr != nil || cmpr == nil {
+			if apiErr != nil {
+				fmt.Fprintf(os.Stderr, "%s ⚠ %s vs %s: %v%s\n", colorYellow, source, target, apiErr, colorReset)
+				return
+			}
+			if cmpr == nil {
 				return
 			}
 
@@ -115,10 +124,16 @@ func showImpl(configPath string, noFetch bool, format, repoName, source string) 
 
 			mu.Lock()
 			result.Divergence[target] = DivergenceInfo{
-				AheadCount:  cmpr.AheadBy,
-				BehindCount: cmpr.BehindBy,
-				LastDate:    lastDate,
-				LastAuthor:  lastAuthor,
+				AheadCount:      cmpr.AheadBy,
+				BehindCount:     cmpr.BehindBy,
+				AheadAdditions:  cmpr.AheadAdditions,
+				AheadDeletions:  cmpr.AheadDeletions,
+				BehindAdditions: cmpr.BehindAdditions,
+				BehindDeletions: cmpr.BehindDeletions,
+				EmptyAheadDiff:  cmpr.EmptyAheadDiff,
+				EmptyBehindDiff: cmpr.EmptyBehindDiff,
+				LastDate:        lastDate,
+				LastAuthor:      lastAuthor,
 			}
 			mu.Unlock()
 		}(target)
@@ -194,10 +209,10 @@ func outputShowTable(result ScanResult) {
 		div := result.Divergence[targetBranch]
 
 		var parts []string
-		if div.AheadCount > 0 {
+		if div.AheadCount > 0 && !div.EmptyAheadDiff {
 			parts = append(parts, fmt.Sprintf("%s↑ %d ahead of source%s", colorYellow, div.AheadCount, colorReset))
 		}
-		if div.BehindCount > 0 {
+		if div.BehindCount > 0 && !div.EmptyBehindDiff {
 			parts = append(parts, fmt.Sprintf("%s↓ %d behind source%s", colorRed, div.BehindCount, colorReset))
 		}
 		if div.IsContentSynced {
@@ -207,7 +222,11 @@ func outputShowTable(result ScanResult) {
 			parts = append(parts, fmt.Sprintf("%s⊙ squash merged%s", colorCyan, colorReset))
 		}
 		if len(parts) == 0 {
-			parts = append(parts, fmt.Sprintf("%s✓ synced%s", colorGreen, colorReset))
+			if div.AheadCount > 0 || div.BehindCount > 0 {
+				parts = append(parts, fmt.Sprintf("%s≡ identical content%s", colorCyan, colorReset))
+			} else {
+				parts = append(parts, fmt.Sprintf("%s✓ synced%s", colorGreen, colorReset))
+			}
 		}
 
 		divergence := strings.Join(parts, "   ")
@@ -228,7 +247,7 @@ func outputShowCSV(result ScanResult) {
 	sort.Strings(branches)
 
 	w := csv.NewWriter(os.Stdout)
-	_ = w.Write([]string{"repository", "source_branch", "branch", "ahead", "behind", "in_sync", "last_date", "last_author"})
+	_ = w.Write([]string{"repository", "source_branch", "branch", "ahead", "behind", "ahead_additions", "ahead_deletions", "behind_additions", "behind_deletions", "in_sync", "last_date", "last_author"})
 	for _, b := range branches {
 		info := result.Divergence[b]
 		_ = w.Write([]string{
@@ -237,6 +256,10 @@ func outputShowCSV(result ScanResult) {
 			b,
 			strconv.Itoa(info.AheadCount),
 			strconv.Itoa(info.BehindCount),
+			strconv.Itoa(info.AheadAdditions),
+			strconv.Itoa(info.AheadDeletions),
+			strconv.Itoa(info.BehindAdditions),
+			strconv.Itoa(info.BehindDeletions),
 			strconv.FormatBool(info.IsContentSynced),
 			info.LastDate,
 			info.LastAuthor,
@@ -253,16 +276,22 @@ func outputShowMarkdown(result ScanResult) {
 	sort.Strings(branches)
 
 	fmt.Printf("## %s (source: `%s`)\n\n", result.Repository, result.SourceBranch)
-	fmt.Println("| Branch | Ahead | Behind | In Sync | Last Date |")
-	fmt.Println("|--------|------:|-------:|:-------:|-----------|")
+	fmt.Println("| Branch | Ahead | Behind | Ahead +/- | Behind +/- | Last Date |")
+	fmt.Println("|--------|------:|-------:|:---------:|:----------:|-----------|")
 	for _, b := range branches {
 		info := result.Divergence[b]
-		sync := "✔"
-		if !info.IsContentSynced {
-			sync = "✗"
+		aheadDisplay := strconv.Itoa(info.AheadCount)
+		if info.EmptyAheadDiff {
+			aheadDisplay = "≡ identical"
 		}
-		fmt.Printf("| `%s` | %d | %d | %s | %s |\n",
-			b, info.AheadCount, info.BehindCount, sync, info.LastDate)
+		behindDisplay := strconv.Itoa(info.BehindCount)
+		if info.EmptyBehindDiff {
+			behindDisplay = "≡ identical"
+		}
+		aheadDelta := fmt.Sprintf("+%d/-%d", info.AheadAdditions, info.AheadDeletions)
+		behindDelta := fmt.Sprintf("+%d/-%d", info.BehindAdditions, info.BehindDeletions)
+		fmt.Printf("| `%s` | %s | %s | %s | %s | %s |\n",
+			b, aheadDisplay, behindDisplay, aheadDelta, behindDelta, info.LastDate)
 	}
 }
 

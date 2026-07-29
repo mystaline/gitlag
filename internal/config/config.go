@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -25,9 +26,10 @@ type AIConfig struct {
 }
 
 type GiteaConfig struct {
-	URL   string      `yaml:"url"`
-	Token string      `yaml:"token"`
-	Repos []RepoConfig `yaml:"repos"`
+	URL     string        `yaml:"url"`
+	Token   string        `yaml:"token"`
+	Timeout time.Duration `yaml:"timeout"`
+	Repos   []RepoConfig  `yaml:"repos"`
 	// Deprecated: use Repos instead. Kept for backward compatibility.
 	Orgs []string `yaml:"orgs"`
 	Org  string   `yaml:"org"`
@@ -66,10 +68,10 @@ func Load(path string) (*Config, error) {
 
 func defaults() *Config {
 	return &Config{
-		Offline:   false,
-		CacheDir:  filepath.Join(os.ExpandEnv("$HOME"), ".gitlag-cache"),
-		Include:   []string{"*"},
-		Exclude:   []string{},
+		Offline:       false,
+		CacheDir:      filepath.Join(os.ExpandEnv("$HOME"), ".gitlag-cache"),
+		Include:       []string{"*"},
+		Exclude:       []string{},
 		BranchParents: make(map[string]string),
 	}
 }
@@ -77,6 +79,9 @@ func defaults() *Config {
 func (c *Config) normalize() {
 	if c.CacheDir == "" {
 		c.CacheDir = filepath.Join(os.ExpandEnv("$HOME"), ".gitlag-cache")
+	}
+	if c.Gitea.Timeout <= 0 {
+		c.Gitea.Timeout = 30 * time.Second
 	}
 	c.CacheDir = strings.ReplaceAll(c.CacheDir, "~", os.ExpandEnv("$HOME"))
 

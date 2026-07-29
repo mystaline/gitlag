@@ -1,4 +1,4 @@
-.PHONY: run build install tidy test help
+.PHONY: run build install tidy test help release
 
 APP=gitlag
 BINDIR?=$(shell go env GOPATH)/bin
@@ -20,3 +20,20 @@ test: ## Run all tests
 
 tidy: ## Tidy go modules
 	go mod tidy
+
+MAJOR ?=
+MINOR ?=
+PATCH ?=
+
+release: ## Tag & push release. Usage: make release [MAJOR=n] [MINOR=n] [PATCH=n]
+	@latest=$$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0"); \
+	ver=$${latest#v}; \
+	cur_major=$$(echo "$$ver" | cut -d. -f1); \
+	cur_minor=$$(echo "$$ver" | cut -d. -f2); \
+	cur_patch=$$(echo "$$ver" | cut -d. -f3); \
+	major=$${MAJOR:-$$cur_major}; \
+	minor=$${MINOR:-$$cur_minor}; \
+	patch=$${PATCH:-$$((cur_patch + 1))}; \
+	tag="v$$major.$$minor.$$patch"; \
+	git fetch --tags --quiet; \
+	git tag "$$tag" && git push origin "$$tag" && echo "pushed $$tag"

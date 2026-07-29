@@ -44,7 +44,7 @@ func runPR(cmd *cobra.Command, args []string) error {
 		fmt.Printf("\n%s 🔍 Discovering open pull requests across repos...%s\n", colorCyan, colorReset)
 	}
 	orgs := cfg.GetOrgs()
-	client := gitea.NewClient(cfg.Gitea.URL, cfg.Gitea.Token, orgs[0])
+	client := gitea.NewClient(cfg.Gitea.URL, cfg.Gitea.Token, orgs[0], cfg.Gitea.Timeout)
 	var repos []gitea.Repository
 
 	for _, repoConfig := range cfg.Gitea.Repos {
@@ -67,7 +67,7 @@ func runPR(cmd *cobra.Command, args []string) error {
 	maxWorkers := runtime.NumCPU()
 
 	var (
-		allPRs   []PRResult
+		allPRs    []PRResult
 		resultsMu sync.Mutex
 		wg        sync.WaitGroup
 		semaphore = make(chan struct{}, maxWorkers)
@@ -87,10 +87,11 @@ func runPR(cmd *cobra.Command, args []string) error {
 			if orgName == "" {
 				orgName = orgs[0]
 			}
-			repoClient := gitea.NewClient(cfg.Gitea.URL, cfg.Gitea.Token, orgName)
+			repoClient := gitea.NewClient(cfg.Gitea.URL, cfg.Gitea.Token, orgName, cfg.Gitea.Timeout)
 
 			pulls, err := repoClient.ListPullRequests(orgName, repo.Name)
 			if err != nil {
+				fmt.Fprintf(os.Stderr, "\r%s ⚠ %s/%s: %v%s\n", colorYellow, orgName, repo.Name, err, colorReset)
 				return
 			}
 			if len(pulls) == 0 {

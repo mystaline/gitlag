@@ -28,10 +28,10 @@ type BulkResult struct {
 }
 
 type BranchComparison struct {
-	TargetBranch string        `json:"target_branch"`
+	TargetBranch string         `json:"target_branch"`
 	Info         DivergenceInfo `json:"info"`
-	InSync       bool          `json:"in_sync"`
-	IsMissing    bool          `json:"is_missing"`
+	InSync       bool           `json:"in_sync"`
+	IsMissing    bool           `json:"is_missing"`
 }
 
 type workerStatus struct {
@@ -53,7 +53,7 @@ func bulkImpl(configPath string, noFetch bool, format, source string, targets []
 		fmt.Printf("\n%s 🔍 Discovering Gitea repositories...%s\n", colorCyan, colorReset)
 	}
 	orgs := cfg.GetOrgs()
-	client := gitea.NewClient(cfg.Gitea.URL, cfg.Gitea.Token, orgs[0])
+	client := gitea.NewClient(cfg.Gitea.URL, cfg.Gitea.Token, orgs[0], cfg.Gitea.Timeout)
 	var repos []gitea.Repository
 
 	for _, repoConfig := range cfg.Gitea.Repos {
@@ -175,7 +175,7 @@ func bulkImpl(configPath string, noFetch bool, format, source string, targets []
 				orgs := cfg.GetOrgs()
 				orgName = orgs[0]
 			}
-			repoClient := gitea.NewClient(cfg.Gitea.URL, cfg.Gitea.Token, orgName)
+			repoClient := gitea.NewClient(cfg.Gitea.URL, cfg.Gitea.Token, orgName, cfg.Gitea.Timeout)
 
 			// Resolve glob patterns via API
 			var availBranches []string
@@ -195,6 +195,19 @@ func bulkImpl(configPath string, noFetch bool, format, source string, targets []
 
 			for _, target := range resolvedTargets {
 				statesMu.Lock()
+				workerStates[slot].status = "check branch " + target + "..."
+				statesMu.Unlock()
+
+				branchInfo, _ := repoClient.GetBranchInfo(orgName, r.Name, target)
+				if branchInfo == nil {
+					result.Comparisons = append(result.Comparisons, BranchComparison{
+						TargetBranch: target,
+						IsMissing:    true,
+					})
+					continue
+				}
+
+				statesMu.Lock()
 				workerStates[slot].status = "API compare " + target + "..."
 				statesMu.Unlock()
 
@@ -202,32 +215,35 @@ func bulkImpl(configPath string, noFetch bool, format, source string, targets []
 				if apiErr != nil {
 					result.Comparisons = append(result.Comparisons, BranchComparison{
 						TargetBranch: target,
-						IsMissing:   true,
+						IsMissing:    true,
 					})
 					continue
 				}
 				if cmpr == nil {
 					result.Comparisons = append(result.Comparisons, BranchComparison{
 						TargetBranch: target,
-						IsMissing:   true,
+						IsMissing:    true,
 					})
 					continue
 				}
 
-				branchInfo, _ := repoClient.GetBranchInfo(orgName, r.Name, target)
-
 				lastDate, lastAuthor := parseBranchInfo(branchInfo)
 
-				contentSynced := cmpr.AheadBy == 0 && cmpr.EmptyBehindDiff
+				contentSynced := (cmpr.AheadBy == 0 || cmpr.EmptyAheadDiff) && (cmpr.BehindBy == 0 || cmpr.EmptyBehindDiff)
 				squashMerged := false
 
 				info := DivergenceInfo{
-					AheadCount:      cmpr.AheadBy,
-					BehindCount:     cmpr.BehindBy,
-					IsContentSynced: contentSynced,
-					IsSquashMerged:  squashMerged,
-					EmptyBehindDiff: cmpr.EmptyBehindDiff,
-					LastDate:        lastDate,
+					AheadCount:       cmpr.AheadBy,
+					BehindCount:      cmpr.BehindBy,
+					AheadAdditions:   cmpr.AheadAdditions,
+					AheadDeletions:   cmpr.AheadDeletions,
+					BehindAdditions:  cmpr.BehindAdditions,
+					BehindDeletions:  cmpr.BehindDeletions,
+					IsContentSynced:  contentSynced,
+					IsSquashMerged:   squashMerged,
+					EmptyAheadDiff:   cmpr.EmptyAheadDiff,
+					EmptyBehindDiff:  cmpr.EmptyBehindDiff,
+					LastDate:         lastDate,
 					LastAuthor:       lastAuthor,
 				}
 
@@ -318,7 +334,7 @@ func unionResolvedTargets(results []BulkResult) []string {
 func outputBulkCSV(results []BulkResult) {
 	sort.Slice(results, func(i, j int) bool { return results[i].Repository < results[j].Repository })
 	w := csv.NewWriter(os.Stdout)
-	_ = w.Write([]string{"repository", "target_branch", "ahead", "behind", "in_sync", "is_missing"})
+	_ = w.Write([]string{"repository", "target_branch", "ahead", "behind", "ahead_additions", "ahead_deletions", "behind_additions", "behind_deletions", "in_sync", "is_missing"})
 	for _, r := range results {
 		for _, c := range r.Comparisons {
 			_ = w.Write([]string{
@@ -326,6 +342,10 @@ func outputBulkCSV(results []BulkResult) {
 				c.TargetBranch,
 				strconv.Itoa(c.Info.AheadCount),
 				strconv.Itoa(c.Info.BehindCount),
+				strconv.Itoa(c.Info.AheadAdditions),
+				strconv.Itoa(c.Info.AheadDeletions),
+				strconv.Itoa(c.Info.BehindAdditions),
+				strconv.Itoa(c.Info.BehindDeletions),
 				strconv.FormatBool(c.InSync),
 				strconv.FormatBool(c.IsMissing),
 			})
@@ -360,16 +380,21 @@ func outputBulkMarkdown(results []BulkResult, source string, targets []string) {
 				row += " — |"
 			case c.InSync:
 				row += " ✔ |"
+			case c.Info.IsContentSynced:
+				row += " ≡ identical |"
 			default:
 				cell := ""
-				if c.Info.AheadCount > 0 {
+				if c.Info.AheadCount > 0 && !c.Info.EmptyAheadDiff {
 					cell += fmt.Sprintf("↑%d", c.Info.AheadCount)
 				}
-				if c.Info.BehindCount > 0 {
+				if c.Info.BehindCount > 0 && !c.Info.EmptyBehindDiff {
 					if cell != "" {
 						cell += " "
 					}
 					cell += fmt.Sprintf("↓%d", c.Info.BehindCount)
+				}
+				if cell == "" {
+					cell = "≡ identical"
 				}
 				row += " " + cell + " |"
 			}
@@ -468,24 +493,24 @@ func outputBulkTable(results []BulkResult, source string, targets []string) {
 
 		for i, target := range targets {
 			comp, ok := compMap[target]
-			
+
 			colored := ""
 			visible := 0
 
 			if !ok || comp.IsMissing {
 				colored = fmt.Sprintf("%s—%s", colorFaint, colorReset)
 				visible = 1
+			} else if comp.InSync {
+				colored = fmt.Sprintf("%s✔ sync%s", colorGreen, colorReset)
+				visible = 6
 			} else if comp.Info.IsContentSynced {
 				colored = fmt.Sprintf("%s≡ identical%s", colorCyan, colorReset)
 				visible = 10
 			} else if comp.Info.IsSquashMerged {
 				colored = fmt.Sprintf("%s⊙ squashed%s", colorCyan, colorReset)
 				visible = 10
-			} else if comp.InSync {
-				colored = fmt.Sprintf("%s✔ sync%s", colorGreen, colorReset)
-				visible = 6
 			} else {
-				if comp.Info.AheadCount > 0 {
+				if comp.Info.AheadCount > 0 && !comp.Info.EmptyAheadDiff {
 					val := fmt.Sprintf("↑ %dA", comp.Info.AheadCount)
 					colored += fmt.Sprintf("%s%s%s", colorYellow, val, colorReset)
 					visible += len([]rune(val))
@@ -499,11 +524,15 @@ func outputBulkTable(results []BulkResult, source string, targets []string) {
 					colored += fmt.Sprintf("%s%s%s", colorRed, val, colorReset)
 					visible += len([]rune(val))
 				}
+				if colored == "" {
+					colored = fmt.Sprintf("%s≡ identical%s", colorCyan, colorReset)
+					visible = 10
+				}
 			}
 
 			fmt.Printf("│%s %s %s", colorReset, padAlign(colored, visible, targetWidths[i], true), colorFaint)
 		}
-		
+
 		timeStr := r.Duration.Round(time.Millisecond).String()
 		fmt.Printf("│%s %s %s│%s\n", colorReset, padAlign(colorFaint+timeStr+colorReset, len(timeStr), timeWidth, true), colorFaint, colorReset)
 	}
